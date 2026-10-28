@@ -23,11 +23,12 @@ const MAX_KEEP = 60;
 const REPLY_INTEGERS = /\b\d{1,3}\b/g;
 
 export class DirectCollector {
-  constructor({ bridge, credentials, dataDir, pulseFloor = 30 }) {
+  constructor({ bridge, credentials, dataDir, pulseFloor = 30, siteKey = "" }) {
     this.bridge = bridge;
     this.credentials = credentials;
     this.dataDir = dataDir;
     this.pulseFloor = pulseFloor;
+    this.siteKey = siteKey;
     this.state = {
       running: false,
       stopRequested: false,
@@ -264,23 +265,42 @@ export class DirectCollector {
     for (let attempt = 0; ; attempt++) {
       const box = page.locator('textarea[placeholder="Ask anything…"]').last();
       await box.waitFor({ state: "visible", timeout: 90_000 }).catch(() => undefined);
-      await box.fill(prompt).catch(async () => {
-        // the composer can remount mid-fill after a re-render; give it one more
-        // window before giving up to the outer retry
-        await page.waitForTimeout(10_000);
-        await box.fill(prompt).catch(() => undefined);
-      });
-      await page.waitForTimeout(800);
-      // TWO send buttons carry this data attribute (the switched-away Agent
-      // form never leaves the DOM), and DOM order is not stable — so "any
-      // enabled one" is the only reliable read, and clicking the disabled
-      // first match is a silent no-op that would burn the whole budget.
+      // The fresh conversation view re-negotiates its own reCAPTCHA widget and
+      // the send button stays disabled until that settles — same trap as the
+      // Agent composer: "execute bound" is not "widget ready". Mint one token
+      // to force the negotiation, then poll (re-filling as needed) for up to
+      // ~90s before declaring the composer stuck.
+      await page
+        .evaluate(
+          ({ siteKey }) =>
+            new Promise((resolve) => {
+              try {
+                const mint = globalThis.grecaptcha?.enterprise?.execute(siteKey, { action: "chat_submit" });
+                if (mint && typeof mint.then === "function") mint.then(() => resolve("ok"), () => resolve("rejected"));
+                else resolve("unbound");
+              } catch {
+                resolve("threw");
+              }
+              setTimeout(() => resolve("timeout"), 60_000);
+            }),
+          { siteKey: this.siteKey }
+        )
+        .catch(() => undefined);
       let enabled = false;
-      for (let i = 0; i < 3 && !enabled; i++) {
+      for (let i = 0; i < 30 && !enabled; i++) {
         enabled = await page
           .evaluate(() => [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled))
           .catch(() => false);
-        if (!enabled) await page.waitForTimeout(1_500);
+        if (!enabled) {
+          const empty = await page
+            .evaluate(() => {
+              const box = [...document.querySelectorAll('textarea[placeholder="Ask anything…"]')].pop();
+              return box ? !box.value.trim() : true;
+            })
+            .catch(() => true);
+          if (empty) await box.fill(prompt).catch(() => undefined);
+          await page.waitForTimeout(3_000);
+        }
       }
       if (!enabled) throw new Error("Direct 发送按钮保持禁用（composer 未就绪）");
       const clicked = await page

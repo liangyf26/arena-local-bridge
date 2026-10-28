@@ -403,6 +403,7 @@ export function createServer({ bridge, config }) {
     credentials: bridge.credentials,
     dataDir: config.dataDir,
     pulseFloor: Number(process.env.ARENA_FINGERPRINT_PULSE_FLOOR || 30),
+    siteKey: config.recaptchaSiteKey,
   });
 
   const server = http.createServer(async (req, res) => {
