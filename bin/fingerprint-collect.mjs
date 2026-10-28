@@ -188,13 +188,15 @@ async function sendProbe(variant) {
               if (ints.length > (best.match(/\b\d{1,3}\b/g) || []).length) best = ints.join(" ");
             }
             const errorish = /prompt failed|rate limit|出现错误|出错了/i.test(text.slice(-500));
-            return { best, errorish };
+            return { best, errorish, echoAt, textLen: text.length };
           },
           { clause }
         )
-        .catch(() => ({ best: "", errorish: false }));
+        .catch(() => ({ best: "", errorish: false, echoAt: -9, textLen: -1 }));
       if (s.errorish) throw new Error(`arena rejected the probe: ${s.after?.slice(-100).trim() || "unknown"}`);
       const count = (s.best.match(/\b\d{1,3}\b/g) || []).length;
+      if (i % 10 === 0)
+        console.log(JSON.stringify({ step: "diag", variant, i, echoAt: s.echoAt, textLen: s.textLen, bestLen: s.best.length, count }));
       if (count >= 100) {
         // stable across two polls = the stream has ended
         if (count === lastInts) return s.best;
