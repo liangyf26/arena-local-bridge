@@ -271,18 +271,29 @@ export class DirectCollector {
         await box.fill(prompt).catch(() => undefined);
       });
       await page.waitForTimeout(800);
+      // TWO send buttons carry this data attribute (the switched-away Agent
+      // form never leaves the DOM), and DOM order is not stable — so "any
+      // enabled one" is the only reliable read, and clicking the disabled
+      // first match is a silent no-op that would burn the whole budget.
       let enabled = false;
       for (let i = 0; i < 3 && !enabled; i++) {
         enabled = await page
-          .evaluate(() => {
-            const b = document.querySelector('button[data-perf-target="send"]');
-            return b ? !b.disabled : false;
-          })
+          .evaluate(() => [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled))
           .catch(() => false);
         if (!enabled) await page.waitForTimeout(1_500);
       }
       if (!enabled) throw new Error("Direct 发送按钮保持禁用（composer 未就绪）");
-      await page.locator('button[data-perf-target="send"]').click({ force: true });
+      const clicked = await page
+        .evaluate(() => {
+          const b = [...document.querySelectorAll('button[data-perf-target="send"]')].find((x) => !x.disabled);
+          if (b) {
+            b.click();
+            return true;
+          }
+          return false;
+        })
+        .catch(() => false);
+      if (!clicked) await box.press("Enter").catch(() => undefined);
 
       const clause = prompt.split("\n")[0].slice(0, 40);
       let reply = null;
@@ -294,10 +305,11 @@ export class DirectCollector {
               const text = document.body?.innerText || "";
               const echoAt = text.lastIndexOf(clause);
               const after = echoAt >= 0 ? text.slice(echoAt + clause.length) : "";
-              const live = (() => {
-                const b = document.querySelector('button[data-perf-target="send"]');
-                return b ? !b.disabled : false;
-              })();
+              // "live" = the composer was emptied again, i.e. the submission
+              // went through — the send buttons themselves are ambiguous here
+              // (the switched-away Agent form keeps its own in the DOM).
+              const box = [...document.querySelectorAll('textarea[placeholder="Ask anything…"]')].pop();
+              const live = box ? !box.value.trim() : false;
               const errorish = /prompt failed|出现错误|出错了|rate limit/i.test(text.slice(-600));
               return { after, live, errorish };
             },
