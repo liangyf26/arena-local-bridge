@@ -164,7 +164,10 @@ async function sendProbe(variant) {
     // present after the prompt echo. Budget: 10 minutes per probe.
     for (let i = 0; i < 200; i++) {
       await page.waitForTimeout(3_000);
-      if (i % 10 === 0) console.log(JSON.stringify({ step: "reply-poll", variant, i }));
+      if (i % 5 === 0) {
+        console.log(JSON.stringify({ step: "reply-poll", variant, i }));
+        await page.screenshot({ path: "/tmp/fp-live.png" }).catch(() => undefined);
+      }
       const s = await page
         .evaluate(
           ({ clause }) => {
