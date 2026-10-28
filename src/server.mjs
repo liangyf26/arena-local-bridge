@@ -394,6 +394,7 @@ export function createServer({ bridge, config }) {
     origin: `http://${config.host}:${config.port}`,
     bridgeKey: config.bridgeKey,
     sessions: readArchiveSessions(config.archiveDir),
+    timeoutMs: config.batchTimeoutMs,
   });
 
   const server = http.createServer(async (req, res) => {

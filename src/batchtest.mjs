@@ -7,10 +7,11 @@
 const MAX_KEEP = 200;
 
 export class BatchTest {
-  constructor({ origin, bridgeKey, sessions }) {
+  constructor({ origin, bridgeKey, sessions, timeoutMs = 300_000 }) {
     this.origin = origin;
     this.bridgeKey = bridgeKey;
     this.sessions = sessions || [];
+    this.timeoutMs = timeoutMs;
     this.state = {
       running: false,
       stopRequested: false,
@@ -83,7 +84,7 @@ export class BatchTest {
     };
     try {
       const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 180_000);
+      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
       const r = await fetch(`${this.origin}/v1/chat/completions`, {
         method: "POST",
         headers: {
@@ -104,7 +105,7 @@ export class BatchTest {
       result.usage = body?.usage || null;
       return result;
     } catch (error) {
-      result.error = error?.name === "AbortError" ? "超时（180s）" : error?.message || String(error);
+      result.error = error?.name === "AbortError" ? `超时（${Math.round(this.timeoutMs / 1000)}s）` : error?.message || String(error);
       return result;
     } finally {
       result.ms = Date.now() - startedAt;

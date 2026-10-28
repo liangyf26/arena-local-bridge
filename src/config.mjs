@@ -72,6 +72,11 @@ export function loadConfig(env = {}, { requireBridgeKey = true } = {}) {
     // e.g. the tailscale MagicDNS name when Tailscale Serve fronts the port.
     // Comma-separated; empty keeps the loopback-only default.
     trustedHosts: String(env.ARENA_TRUSTED_HOSTS || ""),
+    // Per-session budget for batch tests. Arena's agent can legitimately spend
+    // minutes on one turn (autonomous tool loops), and batch turns serialize
+    // through the single account browser, so the old fixed 180s cut off turns
+    // that were still running.
+    batchTimeoutMs: Number(env.ARENA_BATCH_TIMEOUT_MS || 300_000),
     // §4.23 — what to do when the Arena agent invokes its OWN sandbox tool.
     //   allow (default): let it run and keep reading until the agent's final text
     //   block: stop the remote run and report that tools are not executed
