@@ -123,9 +123,11 @@ export class Harvester {
 
       try {
         // Arena rate-limits rapid session creation (429 {"error":"prompt
-        // failed"}). No session exists yet when it fires, so the round can
-        // simply be retried after a growing cool-down instead of being burned
-        // as a failure.
+        // failed"}), and its window outlasts short waits: a 4-round 20-120s
+        // backoff still came back 429. No session exists yet when the 429
+        // fires, so retry on a longer schedule — and once those retries are
+        // exhausted, abort the whole batch: every remaining round would only
+        // re-run the same 9 minutes of waiting.
         let state = null;
         for (let attempt = 0; ; attempt++) {
           try {
@@ -133,8 +135,19 @@ export class Harvester {
             break;
           } catch (error) {
             const rateLimited = /\b429\b/.test(String(error?.message || ""));
-            if (!rateLimited || attempt >= 4) throw error;
-            const waitMs = Math.min(120_000, 20_000 * 2 ** attempt); // 20s, 40s, 80s, 120s
+            const waits = [60_000, 180_000, 300_000];
+            if (!rateLimited || attempt >= waits.length) {
+              if (rateLimited) {
+                throw Object.assign(
+                  new Error(
+                    `Arena 创建限流仍未解除（已退避重试 ${attempt} 次）。限流窗口较长，请稍后再跑，或在 GUI 调大每轮间隔。`
+                  ),
+                  { rateLimitExhausted: true }
+                );
+              }
+              throw error;
+            }
+            const waitMs = waits[attempt];
             round.rateLimitedRetries = (round.rateLimitedRetries || 0) + 1;
             this.state.current = {
               index: i,
@@ -202,6 +215,10 @@ export class Harvester {
         this.state.lastError = round.error;
         consecutiveFailures += 1;
         log.error("harvest", "round failed", { index: i, error: round.error });
+        // Rate-limit retries are exhausted: the window is longer than any
+        // sensible in-run wait, so continuing would only re-run the same
+        // backoff every remaining round.
+        if (error?.rateLimitExhausted) throw error;
         if (consecutiveFailures >= 3) {
           throw new Error(`连续 3 轮失败，已中止：${round.error}`);
         }
