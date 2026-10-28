@@ -122,7 +122,30 @@ export class Harvester {
       this.#push(round);
 
       try {
-        const state = await this.bridge.createAgentSession(page, prompt);
+        // Arena rate-limits rapid session creation (429 {"error":"prompt
+        // failed"}). No session exists yet when it fires, so the round can
+        // simply be retried after a growing cool-down instead of being burned
+        // as a failure.
+        let state = null;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            state = await this.bridge.createAgentSession(page, prompt);
+            break;
+          } catch (error) {
+            const rateLimited = /\b429\b/.test(String(error?.message || ""));
+            if (!rateLimited || attempt >= 4) throw error;
+            const waitMs = Math.min(120_000, 20_000 * 2 ** attempt); // 20s, 40s, 80s, 120s
+            round.rateLimitedRetries = (round.rateLimitedRetries || 0) + 1;
+            this.state.current = {
+              index: i,
+              phase: `Arena 限流，退避 ${Math.round(waitMs / 1000)}s 后重试`,
+              backoffMs: waitMs,
+            };
+            log.warn("harvest", "creation rate-limited; backing off", { index: i, attempt: attempt + 1, waitMs });
+            await new Promise((r) => setTimeout(r, waitMs));
+            if (this.state.stopRequested) throw error;
+          }
+        }
         round.sessionId = state.id;
         this.state.current = { index: i, phase: "识别模型", sessionId: state.id };
 
