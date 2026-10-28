@@ -68,6 +68,10 @@ export function loadConfig(env = {}, { requireBridgeKey = true } = {}) {
     maxQueue: Number(env.ARENA_MAX_QUEUE || 8),
     arenaSessions: env.ARENA_SESSIONS || "",
     archiveDir: env.ARENA_ARCHIVE_DIR || "",
+    // Extra Host/Origin names that may address this server beyond loopback —
+    // e.g. the tailscale MagicDNS name when Tailscale Serve fronts the port.
+    // Comma-separated; empty keeps the loopback-only default.
+    trustedHosts: String(env.ARENA_TRUSTED_HOSTS || ""),
     // §4.23 — what to do when the Arena agent invokes its OWN sandbox tool.
     //   allow (default): let it run and keep reading until the agent's final text
     //   block: stop the remote run and report that tools are not executed

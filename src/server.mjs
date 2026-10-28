@@ -206,6 +206,22 @@ export function readArchiveSessions(archiveDir) {
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
 /**
+ * Hosts beyond loopback that may name this service, from ARENA_TRUSTED_HOSTS
+ * (comma-separated). For a loopback-bound server behind a private overlay
+ * network (Tailscale Serve et al.), these are the addresses the proxy fronts —
+ * the tailnet is the trust boundary, and the DNS-rebinding defense below is
+ * unchanged: a rebound page still arrives with the attacker's Host header.
+ */
+export function allowedHosts(config) {
+  const hosts = new Set(LOCAL_HOSTS);
+  for (const entry of String(config?.trustedHosts || "").split(",")) {
+    const host = entry.trim().toLowerCase();
+    if (host) hosts.add(host);
+  }
+  return hosts;
+}
+
+/**
  * Did this request come from this machine's loopback?
  *
  * Binding 127.0.0.1 is not enough on its own. A web page can point its own
@@ -217,13 +233,13 @@ const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
  * A foreign Origin is rejected for the same reason one step earlier. The GUI is
  * served from this origin, so its own POSTs carry a local Origin and still work.
  */
-function isLocalRequest(req) {
+function isLocalRequest(req, allowed) {
   const name = String(req.headers.host || "").replace(/:\d+$/, "").toLowerCase();
-  if (!LOCAL_HOSTS.has(name)) return false;
+  if (!allowed.has(name)) return false;
   const origin = req.headers.origin;
   if (!origin) return true;
   try {
-    return LOCAL_HOSTS.has(new URL(origin).hostname.toLowerCase());
+    return allowed.has(new URL(origin).hostname.toLowerCase());
   } catch {
     return false;
   }
@@ -383,7 +399,7 @@ export function createServer({ bridge, config }) {
   const server = http.createServer(async (req, res) => {
     // Only this machine may talk to us — see isLocalRequest() for why the
     // loopback bind alone is not enough.
-    if (!isLocalRequest(req)) {
+    if (!isLocalRequest(req, allowedHosts(config))) {
       return json(res, 403, { error: { message: "This server only answers requests from this machine." } });
     }
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);

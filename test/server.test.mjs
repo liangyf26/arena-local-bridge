@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { validateCompletion, RateLimiter, exposesBridgeKey, runReprobe, runFingerprintReprobe, extractCompletionText } from "../src/server.mjs";
+import { validateCompletion, RateLimiter, exposesBridgeKey, allowedHosts, runReprobe, runFingerprintReprobe, extractCompletionText } from "../src/server.mjs";
 import { appendRecord } from "../src/fingerprint/bank-store.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -154,6 +154,22 @@ test("exposesBridgeKey: only while the listener is loopback", () => {
   assert.equal(exposesBridgeKey({ host: "192.168.1.5" }), false);
   assert.equal(exposesBridgeKey({ host: "" }), false);
   assert.equal(exposesBridgeKey({}), false);
+});
+
+// ARENA_TRUSTED_HOSTS extends the loopback Host guard (overlay networks such as
+// Tailscale Serve front the loopback port under their own name). It must parse
+// loosely, stay case-insensitive at match time, and default to loopback only.
+test("allowedHosts: loopback default plus configured trusted hosts", () => {
+  const defaults = allowedHosts({});
+  for (const host of ["127.0.0.1", "localhost", "::1"]) assert.ok(defaults.has(host));
+  assert.equal(defaults.has("bohe-idc.tail478c40.ts.net"), false);
+
+  const trusted = allowedHosts({ trustedHosts: " bohe-idc.tail478c40.ts.net , 100.64.205.66 ,, bohe-idc " });
+  assert.ok(trusted.has("bohe-idc.tail478c40.ts.net"));
+  assert.ok(trusted.has("100.64.205.66"));
+  assert.ok(trusted.has("bohe-idc"));
+  assert.ok(trusted.has("127.0.0.1"), "loopback stays allowed alongside trusted hosts");
+  assert.equal(trusted.has("evil.example"), false);
 });
 
 test("RateLimiter allows up to rpm then blocks with retryAfter", () => {
