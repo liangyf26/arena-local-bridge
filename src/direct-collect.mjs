@@ -288,19 +288,16 @@ export class DirectCollector {
         .catch(() => undefined);
       let enabled = false;
       for (let i = 0; i < 30 && !enabled; i++) {
+        // Re-fill every iteration: a fill that lands while React is still
+        // hydrating the remounted view sets the DOM value without registering
+        // it in component state, and the button stays disabled even though the
+        // textarea "has" text. fill is idempotent, so keep re-applying until
+        // the button reacts.
+        await box.fill(prompt).catch(() => undefined);
+        await page.waitForTimeout(3_000);
         enabled = await page
           .evaluate(() => [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled))
           .catch(() => false);
-        if (!enabled) {
-          const empty = await page
-            .evaluate(() => {
-              const box = [...document.querySelectorAll('textarea[placeholder="Ask anything…"]')].pop();
-              return box ? !box.value.trim() : true;
-            })
-            .catch(() => true);
-          if (empty) await box.fill(prompt).catch(() => undefined);
-          await page.waitForTimeout(3_000);
-        }
       }
       if (!enabled) throw new Error("Direct 发送按钮保持禁用（composer 未就绪）");
       const clicked = await page
