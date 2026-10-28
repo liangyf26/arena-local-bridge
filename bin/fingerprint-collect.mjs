@@ -158,17 +158,20 @@ async function sendProbe(variant) {
       .catch(() => false);
     if (!clicked) await box.press("Enter").catch(() => undefined);
 
-    for (let i = 0; i < 40; i++) {
+    // High-tier models think for minutes before emitting the numbers; the
+    // send button staying disabled during that window is NORMAL, not a failed
+    // submission. Completion = the button re-enabled AND a full integer run
+    // present after the prompt echo. Budget: 10 minutes per probe.
+    for (let i = 0; i < 200; i++) {
       await page.waitForTimeout(3_000);
-      console.log(JSON.stringify({ step: "reply-poll", variant, i }));
+      if (i % 10 === 0) console.log(JSON.stringify({ step: "reply-poll", variant, i }));
       const s = await page
         .evaluate(
           ({ clause }) => {
             const text = document.body?.innerText || "";
             const echoAt = text.lastIndexOf(clause);
             const after = echoAt >= 0 ? text.slice(echoAt + clause.length) : "";
-            const boxEl = [...document.querySelectorAll('textarea[placeholder="Ask anything…"]')].pop();
-            const live = boxEl ? !boxEl.value.trim() : false;
+            const live = [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled);
             const errorish = /prompt failed|rate limit|出现错误|出错了/i.test(text.slice(-500));
             return { after, live, errorish };
           },
