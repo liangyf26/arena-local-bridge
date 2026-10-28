@@ -19,6 +19,7 @@ import { LocalMcpRuntime } from "./local-mcp-runtime.mjs";
 import { stats as archiveStats, readEntries, removeEntries, sessionAccountEmail, sessionIdFromUrl, updateModel } from "./archive.mjs";
 import { Harvester } from "./harvest.mjs";
 import { BatchTest } from "./batchtest.mjs";
+import { DirectCollector } from "./direct-collect.mjs";
 import { readSnapshot } from "./probe/index.mjs";
 import { identify, bankStatus, variantIds, probePrompt } from "./fingerprint/index.mjs";
 import { VERSION } from "./version.mjs";
@@ -395,6 +396,13 @@ export function createServer({ bridge, config }) {
     bridgeKey: config.bridgeKey,
     sessions: readArchiveSessions(config.archiveDir),
     timeoutMs: config.batchTimeoutMs,
+  });
+  // 指纹库采集: Direct 模式按官方模型 ID 采样（见 src/direct-collect.mjs）。
+  const directCollector = new DirectCollector({
+    bridge,
+    credentials: bridge.credentials,
+    dataDir: config.dataDir,
+    pulseFloor: Number(process.env.ARENA_FINGERPRINT_PULSE_FLOOR || 30),
   });
 
   const server = http.createServer(async (req, res) => {
@@ -874,6 +882,20 @@ export function createServer({ bridge, config }) {
     }
     if (req.method === "POST" && url.pathname === "/api/test/stop") {
       return json(res, 200, batch.stop());
+    }
+    // 指纹库采集: Direct 模式下以官方模型 ID 采样入库（身份由 Arena 的模型
+    // 选择器保证）。采集是长任务，状态经 /status 轮询。
+    if (url.pathname === "/api/fingerprint/collect/status") {
+      return json(res, 200, directCollector.status());
+    }
+    if (req.method === "POST" && url.pathname === "/api/fingerprint/collect") {
+      const body = await readBody(req);
+      const result = directCollector.start({ modelIds: Array.isArray(body.modelIds) ? body.modelIds.map(String) : [] });
+      if (!result.ok) return json(res, 400, { error: { message: result.error } });
+      return json(res, 200, result);
+    }
+    if (req.method === "POST" && url.pathname === "/api/fingerprint/collect/stop") {
+      return json(res, 200, directCollector.stop());
     }
     if (req.method === "POST" && url.pathname === "/api/mcp/start") {
       try {
