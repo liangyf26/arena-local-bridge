@@ -136,13 +136,16 @@ async function sendProbe(variant) {
     for (let i = 0; i < 20 && !enabled; i++) {
       // re-fill every iteration: a fill landing while React is still
       // hydrating sets the DOM value without registering it in state
+      console.log(JSON.stringify({ step: "fill", variant, i }));
       await box.fill(prompt).catch(() => undefined);
       await page.waitForTimeout(3_000);
       enabled = await page
         .evaluate(() => [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled))
         .catch(() => false);
+      console.log(JSON.stringify({ step: "enabled-check", variant, i, enabled }));
     }
     if (!enabled) throw new Error("send button stayed disabled (composer not ready)");
+    console.log(JSON.stringify({ step: "clicking", variant }));
     const clicked = await page
       .evaluate(() => {
         const b = [...document.querySelectorAll('button[data-perf-target="send"]')].find((x) => !x.disabled);
@@ -157,6 +160,7 @@ async function sendProbe(variant) {
 
     for (let i = 0; i < 40; i++) {
       await page.waitForTimeout(3_000);
+      console.log(JSON.stringify({ step: "reply-poll", variant, i }));
       const s = await page
         .evaluate(
           ({ clause }) => {
