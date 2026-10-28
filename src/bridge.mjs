@@ -496,6 +496,57 @@ export class Bridge {
     return true;
   }
 
+  /**
+   * Arena's frontend attaches the reCAPTCHA v3 token itself when Send is
+   * clicked. Two slow-network traps sit between "script loaded" and "the click
+   * produces a POST": grecaptcha.enterprise.execute is bound seconds after the
+   * script arrives (clicking inside that window posts without a token and
+   * earns Arena's 403 "recaptcha validation failed"), and the enterprise widget
+   * only finishes negotiating with Google after its anchor round-trip — until
+   * then the frontend's own mint hangs and the create/append POST never leaves
+   * at all, which surfaces as a waitForResponse timeout. Gate the send on one
+   * complete mint of our own; every wait is bounded and never fatal.
+   */
+  async #warmRecaptcha(page) {
+    await page
+      .waitForFunction(() => typeof globalThis.grecaptcha?.enterprise?.execute === "function", null, {
+        timeout: this.config.composerWaitMs,
+        polling: 500,
+      })
+      .catch(() => undefined);
+    const outcome = await page
+      .evaluate(
+        ({ siteKey, budgetMs }) =>
+          new Promise((resolve) => {
+            const budget = setTimeout(() => resolve("budget-exceeded"), budgetMs);
+            try {
+              const mint = globalThis.grecaptcha?.enterprise?.execute(siteKey, { action: "chat_submit" });
+              if (mint && typeof mint.then === "function") {
+                mint.then(
+                  () => {
+                    clearTimeout(budget);
+                    resolve("minted");
+                  },
+                  () => {
+                    clearTimeout(budget);
+                    resolve("mint-rejected");
+                  }
+                );
+              } else {
+                clearTimeout(budget);
+                resolve("execute-unbound");
+              }
+            } catch {
+              clearTimeout(budget);
+              resolve("execute-threw");
+            }
+          }),
+        { siteKey: this.config.recaptchaSiteKey, budgetMs: this.config.composerWaitMs }
+      )
+      .catch(() => undefined);
+    log.info("bridge", "recaptcha warmup", { outcome });
+  }
+
   async createAgentSession(page, prompt) {
     await page.goto("https://arena.ai/agent", { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => undefined);
@@ -503,12 +554,53 @@ export class Bridge {
     const acceptCookies = page.getByRole("button", { name: "Accept Cookies" });
     if (await acceptCookies.count()) await acceptCookies.click().catch(() => undefined);
     const editor = page.locator('[contenteditable="true"]').last();
-    await editor.waitFor({ state: "visible", timeout: 60_000 });
+    await editor.waitFor({ state: "visible", timeout: this.config.composerWaitMs });
     await editor.fill(prompt);
+    // Playwright's fill can land before ProseMirror's React binding is ready;
+    // an unregistered fill leaves the Send button disabled, the click below
+    // becomes a silent no-op, and the turn burns the whole response budget on a
+    // POST that never fires. Verify the button went live; retry through
+    // insertText, then surface a clear error instead of a raw timeout.
+    let btnEnabled = false;
+    for (let attempt = 0; attempt < 3 && !btnEnabled; attempt++) {
+      if (attempt > 0) {
+        await page
+          .evaluate((text) => {
+            const editors = Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(
+              (e) => e.offsetParent !== null
+            );
+            const target = editors[editors.length - 1];
+            if (!target) return;
+            target.focus();
+            document.execCommand("insertText", false, text);
+            target.dispatchEvent(new Event("input", { bubbles: true }));
+          }, prompt)
+          .catch(() => undefined);
+        await page.waitForTimeout(1_500);
+      }
+      btnEnabled = await page
+        .evaluate(() => {
+          const btn = document.querySelector('button[aria-label="Send message"]');
+          return btn ? !btn.disabled : false;
+        })
+        .catch(() => false);
+    }
+    log.info("bridge", "create composer prepared", { btnEnabled });
+    if (!btnEnabled) {
+      throw Object.assign(
+        new Error(
+          "Arena composer did not accept the prompt: the Send button stayed disabled after fill retries. " +
+            "Usually a slow-network hydration race; retry the round."
+        ),
+        { status: 502, code: "composer_not_ready" }
+      );
+    }
     const createResponse = page.waitForResponse(
       (response) => response.url().includes("/nextjs-api/stream/create-chat"),
-      { timeout: 60_000 }
+      { timeout: this.config.composerWaitMs }
     );
+    // Arena's frontend attaches the reCAPTCHA v3 token itself right here.
+    await this.#warmRecaptcha(page);
     await page.locator('button[aria-label="Send message"]').click({ force: true });
     const response = await createResponse;
     const createText = await response.text().catch(() => "");
@@ -570,7 +662,10 @@ export class Bridge {
       await page.waitForTimeout(5_000);
     }
     await page
-      .waitForSelector('[contenteditable="true"]', { state: "visible", timeout: reusePage ? 10_000 : 30_000 })
+      .waitForSelector('[contenteditable="true"]', {
+        state: "visible",
+        timeout: reusePage ? 10_000 : this.config.composerWaitMs,
+      })
       .catch(() => undefined);
     // Reused pages are already interactive; the old fixed 2s sleep was only there
     // to let a fresh navigation settle.
@@ -632,7 +727,7 @@ export class Bridge {
       if (((await editor.count().catch(() => 0))) > 0) break;
     }
     try {
-      await editor.waitFor({ state: "visible", timeout: 60_000 });
+      await editor.waitFor({ state: "visible", timeout: this.config.composerWaitMs });
     } catch {
       // The composer never became visible. On this UI that means the session is
       // NOT in an interactive state: it is showing the "was this task
@@ -667,9 +762,23 @@ export class Bridge {
         target.dispatchEvent(new Event("input", { bubbles: true }));
       }, prompt)
       .catch(() => undefined);
+    // The insertText path can silently no-op (composer mounted mid-wait, React
+    // ignored the synthetic input, a re-render replaced the node). An empty
+    // composer leaves the Send button disabled and the turn would hang on the
+    // append POST, so verify the text landed and retry through .fill() if not.
+    let filled = false;
+    for (let i = 0; i < 2 && !filled; i++) {
+      if (i > 0) await editor.fill(prompt).catch(() => undefined);
+      filled = await editor
+        .textContent()
+        .then((t) => String(t || "").trim().length > 0)
+        .catch(() => false);
+      if (!filled) await page.waitForTimeout(1_000);
+    }
+    log.info("bridge", "append composer prepared", { sessionId: state.id, filled });
     const appendResponse = page.waitForResponse(
       (response) => response.url().includes(`/sessions/${state.id}/in/append`),
-      { timeout: 60_000 }
+      { timeout: this.config.composerWaitMs }
     );
     let observedToken = "";
     const tokenListener = (request) => {
@@ -687,19 +796,23 @@ export class Bridge {
     // arena's own frontend attach the reCAPTCHA v3 token and POST the message —
     // verified working on the live /agent page. Fall back to Enter only if the
     // button can't be located in this particular UI state.
+    // Same reCAPTCHA trap as createAgentSession — see #warmRecaptcha.
+    await this.#warmRecaptcha(page);
     const clickedSend = await page
       .evaluate(() => {
         const btn = Array.from(document.querySelectorAll("button")).find((b) =>
           /^(Send message|发送消息)$/i.test((b.innerText || b.getAttribute("aria-label") || "").trim())
         );
-        if (btn) {
-          btn.click();
-          return true;
-        }
-        return false;
+        if (!btn) return { found: false, enabled: false };
+        btn.click();
+        // The button renders disabled until the composer text reaches React
+        // state; clicking a disabled button is a silent no-op and the turn
+        // would hang forever waiting for the append POST. Report that so the
+        // caller can fall back to pressing Enter inside the editor itself.
+        return { found: true, enabled: !btn.disabled };
       })
-      .catch(() => false);
-    if (!clickedSend) await editor.press("Enter").catch(() => undefined);
+      .catch(() => ({ found: false, enabled: false }));
+    if (!clickedSend.found || !clickedSend.enabled) await editor.press("Enter").catch(() => undefined);
     const response = await appendResponse;
     const outputRequest = await freshOutputRequest;
     if (outputRequest) {

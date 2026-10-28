@@ -210,6 +210,8 @@ export class ArenaBrowser {
     this.probedPages = new WeakSet();
     // False once we know assets/arena-model-probe.inject.js is missing.
     this.probeAvailable = true;
+    // Set by close(): a scheduled idle rebuild must not outlive shutdown.
+    this.closed = false;
   }
 
   async launch() {
@@ -247,6 +249,10 @@ export class ArenaBrowser {
         staleSince: 0,
         warned: false,
         leases: 0,
+        // Newest credential getPage saw — the idle rebuild in release() uses it.
+        credential: null,
+        // Set while a scheduled idle rebuild is in flight; getPage awaits it.
+        rebuildPromise: null,
       };
       this.contexts.set(account, entry);
     }
@@ -282,6 +288,18 @@ export class ArenaBrowser {
   release(account = "") {
     const entry = this.contexts.get(String(account || ""));
     if (entry && entry.leases > 0) entry.leases -= 1;
+    // Idle and dirty: this is the "next idle call" the stale-context warning
+    // promised. Rebuild now with the newest credential getPage saw, so a
+    // refreshed cookie takes effect without a restart. Nothing else holds a
+    // lease here, so closing the context cannot kill anyone's turn.
+    if (entry && entry.leases === 0 && entry.staleSince && entry.credential && !this.closed) {
+      const credential = entry.credential;
+      entry.rebuildPromise = this.#rebuildContext(entry, credential, account, "rebuild")
+        .catch((error) => log.error("browser", "idle context rebuild failed", { account, error: error.message }))
+        .finally(() => {
+          entry.rebuildPromise = null;
+        });
+    }
   }
 
   /**
@@ -313,6 +331,10 @@ export class ArenaBrowser {
     assertPagePurpose(purpose);
     const entry = this.#entry(account);
 
+    // A scheduled idle rebuild (see release()) may still be running; wait it
+    // out so nobody races a context that is mid-replacement.
+    if (entry.rebuildPromise) await entry.rebuildPromise.catch(() => undefined);
+
     // A credential that changed means this Account's cookies are stale — but
     // only this Account's, and only until it goes idle. See contextAction().
     // `staleSince` is also what the status endpoint reports, so a context that
@@ -333,61 +355,9 @@ export class ArenaBrowser {
       });
     }
     if (action === "create" || action === "rebuild") {
-      await entry.context?.close().catch(() => undefined);
-      // The old context took its pages with it, so this is a fresh Map rather
-      // than a cleanup pass — a stale entry here could only ever be a dead page.
-      entry.pages = new Map();
-      const contextOpts = {
-        viewport: { width: 1440, height: 900 },
-        locale: process.env.ARENA_LOCALE || "zh-CN",
-      };
-      if (this.userAgent) contextOpts.userAgent = this.userAgent;
-      entry.context = await (await this.launch()).newContext(contextOpts);
-      // Hide Playwright automation signals so reCAPTCHA v3 scores the session as
-      // a genuine browser (same reason the Arena模型助手 WebView2 build passes:
-      // a real browser engine reports navigator.webdriver === false). Mirrors the
-      // --disable-blink-features=AutomationControlled launch flag above.
-      await entry.context.addInitScript(() => {
-        try {
-          Object.defineProperty(Navigator.prototype, "webdriver", { get: () => false, configurable: true });
-        } catch {}
-        try {
-          Object.defineProperty(navigator, "webdriver", { get: () => false, configurable: true });
-        } catch {}
-        try {
-          // Drop common CDP/Playwright artifacts that bot detectors fingerprint.
-          delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-          delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-          delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-        } catch {}
-        // Spoof the rest of the navigator fingerprint so it reads like a normal
-        // desktop Edge/Chrome (mirrors the Arena模型助手 FingerprintEnvironment.js,
-        // which fakes these same props — reCAPTCHA cross-checks them).
-        const spoof = {
-          platform: "Win32",
-          vendor: "Google Inc.",
-          hardwareConcurrency: 8,
-          deviceMemory: 8,
-          maxTouchPoints: 0,
-          language: "zh-CN",
-          languages: ["zh-CN", "zh"],
-        };
-        for (const [k, v] of Object.entries(spoof)) {
-          try {
-            Object.defineProperty(Navigator.prototype, k, { get: () => v, configurable: true });
-          } catch {}
-        }
-      });
-      if (cookieHeader) await entry.context.addCookies(cookieHeaderToObjects(cookieHeader));
-      // After the Account's own cookies: the pin has to be the __vdpl this
-      // context sends, and the create-chat route has to exist before the page
-      // that will POST it is created.
-      await installDeploymentPin(entry.context, deploymentPin());
-      entry.signature = signature;
-      entry.staleSince = 0;
-      entry.warned = false;
-      if (action === "rebuild") log.info("browser", "context rebuilt for a refreshed credential", { account });
+      await this.#rebuildContext(entry, credential, account, action);
     }
+    if (credential) entry.credential = credential;
 
     const held = entry.pages.get(purpose);
     if (pageAction({ hasPage: Boolean(held), closed: Boolean(held?.isClosed?.()) }) === "create") {
@@ -410,6 +380,70 @@ export class ArenaBrowser {
       }
     }
     return page;
+  }
+
+  /**
+   * Replace an Account's context with one carrying `credential`'s cookies.
+   * Used by getPage() for the create/rebuild actions and by release() for the
+   * scheduled idle rebuild; `action` only picks the log line.
+   */
+  async #rebuildContext(entry, credential, account, action) {
+    const signature = String(credential?.updatedAt || "");
+    const cookieHeader = String(credential?.cookieHeader || "");
+    await entry.context?.close().catch(() => undefined);
+    // The old context took its pages with it, so this is a fresh Map rather
+    // than a cleanup pass — a stale entry here could only ever be a dead page.
+    entry.pages = new Map();
+    const contextOpts = {
+      viewport: { width: 1440, height: 900 },
+      locale: process.env.ARENA_LOCALE || "zh-CN",
+    };
+    if (this.userAgent) contextOpts.userAgent = this.userAgent;
+    entry.context = await (await this.launch()).newContext(contextOpts);
+    // Hide Playwright automation signals so reCAPTCHA v3 scores the session as
+    // a genuine browser (same reason the Arena模型助手 WebView2 build passes:
+    // a real browser engine reports navigator.webdriver === false). Mirrors the
+    // --disable-blink-features=AutomationControlled launch flag above.
+    await entry.context.addInitScript(() => {
+      try {
+        Object.defineProperty(Navigator.prototype, "webdriver", { get: () => false, configurable: true });
+      } catch {}
+      try {
+        Object.defineProperty(navigator, "webdriver", { get: () => false, configurable: true });
+      } catch {}
+      try {
+        // Drop common CDP/Playwright artifacts that bot detectors fingerprint.
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+      } catch {}
+      // Spoof the rest of the navigator fingerprint so it reads like a normal
+      // desktop Edge/Chrome (mirrors the Arena模型助手 FingerprintEnvironment.js,
+      // which fakes these same props — reCAPTCHA cross-checks them).
+      const spoof = {
+        platform: "Win32",
+        vendor: "Google Inc.",
+        hardwareConcurrency: 8,
+        deviceMemory: 8,
+        maxTouchPoints: 0,
+        language: "zh-CN",
+        languages: ["zh-CN", "zh"],
+      };
+      for (const [k, v] of Object.entries(spoof)) {
+        try {
+          Object.defineProperty(Navigator.prototype, k, { get: () => v, configurable: true });
+        } catch {}
+      }
+    });
+    if (cookieHeader) await entry.context.addCookies(cookieHeaderToObjects(cookieHeader));
+    // After the Account's own cookies: the pin has to be the __vdpl this
+    // context sends, and the create-chat route has to exist before the page
+    // that will POST it is created.
+    await installDeploymentPin(entry.context, deploymentPin());
+    entry.signature = signature;
+    entry.staleSince = 0;
+    entry.warned = false;
+    if (action === "rebuild") log.info("browser", "context rebuilt for a refreshed credential", { account });
   }
 
   /**
@@ -441,6 +475,12 @@ export class ArenaBrowser {
 
   /** Shutdown, or recovery after the browser died: close every Account's context. */
   async close() {
+    this.closed = true;
+    // Let a scheduled idle rebuild finish (or fail) before tearing down, so it
+    // cannot recreate a context after this loop has cleared everything.
+    for (const entry of this.contexts.values()) {
+      if (entry.rebuildPromise) await entry.rebuildPromise.catch(() => undefined);
+    }
     for (const entry of this.contexts.values()) {
       await entry.context?.close().catch(() => undefined);
       entry.context = null;

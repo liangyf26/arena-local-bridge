@@ -58,6 +58,11 @@ export function loadConfig(env = {}, { requireBridgeKey = true } = {}) {
     sessionTtlMs: Number(env.ARENA_SESSION_TTL_MS || 12 * 60 * 60 * 1000),
     refreshMarginSec: Number(env.ARENA_REFRESH_MARGIN_SEC || 1200),
     recaptchaTtlMs: Number(env.ARENA_RECAPTCHA_TTL_MS || 110_000),
+    // How long the message composer may take to become visible after a page
+    // load. The upstream default (60s) fits a direct connection; a proxied
+    // browser stretches arena.ai's asset waterfall well past that, so slow
+    // networks need a bigger budget (e.g. ARENA_COMPOSER_WAIT_MS=180000).
+    composerWaitMs: Number(env.ARENA_COMPOSER_WAIT_MS || 60_000),
     rateLimitRpm: Number(env.ARENA_RATE_LIMIT_RPM || 100),
     maxToolCalls: Number(env.ARENA_MAX_TOOL_CALLS || 8),
     maxQueue: Number(env.ARENA_MAX_QUEUE || 8),
