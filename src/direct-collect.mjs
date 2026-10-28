@@ -281,7 +281,28 @@ export class DirectCollector {
           .evaluate(() => [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled))
           .catch(() => false);
       }
-      if (!enabled) throw new Error("Direct 发送按钮保持禁用（composer 未就绪）");
+      if (!enabled) {
+        // Capture the stuck page before giving up — guessing at this state has
+        // cost three rounds already.
+        try {
+          const diag = await page.evaluate(() => ({
+            url: location.href,
+            sendBtns: [...document.querySelectorAll('button[data-perf-target="send"]')].map((b) => ({
+              disabled: b.disabled,
+              visible: !!(b.offsetWidth || b.offsetHeight),
+            })),
+            textareas: [...document.querySelectorAll("textarea")].map((t) => ({
+              ph: t.placeholder,
+              value: (t.value || "").slice(0, 40),
+              visible: !!(t.offsetWidth || t.offsetHeight),
+            })),
+            bodyTail: (document.body?.innerText || "").slice(-350),
+          }));
+          log.error("direct-collect", "composer stuck; page state", diag);
+          await page.screenshot({ path: "/tmp/direct-collect-stuck.png" }).catch(() => undefined);
+        } catch {}
+        throw new Error("Direct 发送按钮保持禁用（composer 未就绪）");
+      }
       const clicked = await page
         .evaluate(() => {
           const b = [...document.querySelectorAll('button[data-perf-target="send"]')].find((x) => !x.disabled);
