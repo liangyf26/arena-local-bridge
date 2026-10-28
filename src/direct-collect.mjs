@@ -242,7 +242,14 @@ export class DirectCollector {
       throw new Error(`Direct 模型列表中找不到 "${modelId}"（该模型可能不开放 Direct 模式）`);
     }
     log.info("direct-collect", "model selected", { modelId, chose });
-    await page.waitForTimeout(3_000);
+    // Picking a model re-renders the conversation area; the textarea goes away
+    // and remounts on the fresh view. Wait it out before the first probe.
+    await page
+      .locator('textarea[placeholder="Ask anything…"]')
+      .last()
+      .waitFor({ state: "visible", timeout: 90_000 })
+      .catch(() => undefined);
+    await page.waitForTimeout(2_000);
   }
 
   /** Send one probe variant and return the reply text (the integer run after the prompt echo). */
@@ -256,7 +263,13 @@ export class DirectCollector {
 
     for (let attempt = 0; ; attempt++) {
       const box = page.locator('textarea[placeholder="Ask anything…"]').last();
-      await box.fill(prompt);
+      await box.waitFor({ state: "visible", timeout: 90_000 }).catch(() => undefined);
+      await box.fill(prompt).catch(async () => {
+        // the composer can remount mid-fill after a re-render; give it one more
+        // window before giving up to the outer retry
+        await page.waitForTimeout(10_000);
+        await box.fill(prompt).catch(() => undefined);
+      });
       await page.waitForTimeout(800);
       let enabled = false;
       for (let i = 0; i < 3 && !enabled; i++) {
