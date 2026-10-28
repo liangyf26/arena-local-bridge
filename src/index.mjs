@@ -27,7 +27,7 @@ async function main() {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const dotEnv = loadDotEnv(path.join(dataDir, ".env"));
   const mergedEnv = { ...dotEnv, ...process.env };
-  const config = loadConfig(mergedEnv);
+  let config = loadConfig(mergedEnv);
   log.info("boot", "arena-bridge starting", {
     version: VERSION,
     host: config.host,
@@ -116,6 +116,21 @@ async function main() {
   }
 
   // 5. Browser + bridge + recaptcha
+  // ARENA_AGENT_SPLIT_PROXY=1 — start a loopback host-splitting CONNECT proxy
+  // and point the browser at it: allowlisted hosts (Google, for reCAPTCHA) go
+  // through the configured socks5 upstream, arena.ai connects directly. See
+  // src/split-proxy.mjs.
+  if (mergedEnv.ARENA_AGENT_SPLIT_PROXY && config.proxy) {
+    const { startSplitProxy } = await import("./split-proxy.mjs");
+    const splitPort = Number(mergedEnv.ARENA_SPLIT_PROXY_PORT || 18080);
+    startSplitProxy({ port: splitPort, upstream: config.proxy, proxyHosts: mergedEnv.ARENA_SPLIT_PROXY_HOSTS });
+    log.info("boot", "split proxy enabled", {
+      listen: `127.0.0.1:${splitPort}`,
+      upstream: config.proxy,
+      hosts: mergedEnv.ARENA_SPLIT_PROXY_HOSTS || "(default)",
+    });
+    config = { ...config, proxy: `http://127.0.0.1:${splitPort}` };
+  }
   const bridge = new Bridge({ config, credentials, recaptcha: null, startedAt: STARTED_AT });
   bridge.launcherInstance = String(process.env.ARENA_LAUNCHER_INSTANCE || "");
   const recaptcha = new RecaptchaBroker({
