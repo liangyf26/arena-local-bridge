@@ -129,8 +129,10 @@ async function pickModel(modelId) {
 async function sendProbe(variant) {
   const prompt = probeTurn(variant);
   const clause = prompt.split("\n")[0].slice(0, 40);
+  // The composer placeholder changes with state: "Ask anything…" on a fresh
+  // Direct page, "Ask followup…" once the conversation exists — target both.
+  const box = page.locator('textarea[placeholder^="Ask"]').last();
   for (let attempt = 0; attempt < 3; attempt++) {
-    const box = page.locator('textarea[placeholder="Ask anything…"]').last();
     await box.waitFor({ state: "visible", timeout: 60_000 }).catch(() => undefined);
     let enabled = false;
     for (let i = 0; i < 20 && !enabled; i++) {
@@ -140,7 +142,7 @@ async function sendProbe(variant) {
       await box.fill(prompt).catch(() => undefined);
       await page.waitForTimeout(3_000);
       enabled = await page
-        .evaluate(() => [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled))
+        .evaluate(() => [...document.querySelectorAll('button[aria-label="Send message"], button[data-perf-target="send"]')].some((b) => !b.disabled))
         .catch(() => false);
       console.log(JSON.stringify({ step: "enabled-check", variant, i, enabled }));
     }
@@ -148,7 +150,7 @@ async function sendProbe(variant) {
     console.log(JSON.stringify({ step: "clicking", variant }));
     const clicked = await page
       .evaluate(() => {
-        const b = [...document.querySelectorAll('button[data-perf-target="send"]')].find((x) => !x.disabled);
+        const b = [...document.querySelectorAll('button[aria-label="Send message"], button[data-perf-target="send"]')].find((x) => !x.disabled);
         if (b) {
           b.click();
           return true;
@@ -160,11 +162,14 @@ async function sendProbe(variant) {
 
     // High-tier models think for minutes before emitting the numbers; the
     // send button staying disabled during that window is NORMAL, not a failed
-    // submission. Completion = the button re-enabled AND a full integer run
-    // present after the prompt echo. Budget: 10 minutes per probe.
+    // submission. The followup form's send button carries no data-perf-target,
+    // so the button is NOT a reliable signal here — completion is a full
+    // integer run after the prompt echo that stays stable across two polls.
+    // Budget: 10 minutes per probe.
+    let lastInts = 0;
     for (let i = 0; i < 200; i++) {
       await page.waitForTimeout(3_000);
-      if (i % 5 === 0) {
+      if (i % 10 === 0) {
         console.log(JSON.stringify({ step: "reply-poll", variant, i }));
         await page.screenshot({ path: "/tmp/fp-live.png" }).catch(() => undefined);
       }
@@ -174,16 +179,19 @@ async function sendProbe(variant) {
             const text = document.body?.innerText || "";
             const echoAt = text.lastIndexOf(clause);
             const after = echoAt >= 0 ? text.slice(echoAt + clause.length) : "";
-            const live = [...document.querySelectorAll('button[data-perf-target="send"]')].some((b) => !b.disabled);
             const errorish = /prompt failed|rate limit|出现错误|出错了/i.test(text.slice(-500));
-            return { after, live, errorish };
+            return { after, errorish };
           },
           { clause }
         )
-        .catch(() => ({ after: "", live: false, errorish: false }));
+        .catch(() => ({ after: "", errorish: false }));
       if (s.errorish) throw new Error(`arena rejected the probe: ${s.after.slice(-100).trim()}`);
-      const ints = s.after.match(/\b\d{1,3}\b/g) || [];
-      if (s.live && ints.length >= 30) return ints.join(" ");
+      const ints = (s.after.match(/\b\d{1,3}\b/g) || []).length;
+      if (ints >= 30) {
+        // stable across two polls = the stream has ended
+        if (ints === lastInts) return (s.after.match(/\b\d{1,3}\b/g) || []).join(" ");
+        lastInts = ints;
+      }
     }
     log.warn("fingerprint-collect", "probe reply not captured; retrying", { variant, attempt: attempt + 1 });
   }
