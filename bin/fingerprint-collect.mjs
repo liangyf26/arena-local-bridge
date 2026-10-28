@@ -179,18 +179,26 @@ async function sendProbe(variant) {
             const text = document.body?.innerText || "";
             const echoAt = text.lastIndexOf(clause);
             const after = echoAt >= 0 ? text.slice(echoAt + clause.length) : "";
+            // The reply is one paragraph of integers; timestamps ("2s | 57
+            // minutes ago") tick every minute and pollute any whole-text
+            // integer count, so track the LONGEST integer paragraph instead.
+            let best = "";
+            for (const para of after.split(/\n{2,}/)) {
+              const ints = para.match(/\b\d{1,3}\b/g) || [];
+              if (ints.length > (best.match(/\b\d{1,3}\b/g) || []).length) best = ints.join(" ");
+            }
             const errorish = /prompt failed|rate limit|出现错误|出错了/i.test(text.slice(-500));
-            return { after, errorish };
+            return { best, errorish };
           },
           { clause }
         )
-        .catch(() => ({ after: "", errorish: false }));
-      if (s.errorish) throw new Error(`arena rejected the probe: ${s.after.slice(-100).trim()}`);
-      const ints = (s.after.match(/\b\d{1,3}\b/g) || []).length;
-      if (ints >= 30) {
+        .catch(() => ({ best: "", errorish: false }));
+      if (s.errorish) throw new Error(`arena rejected the probe: ${s.after?.slice(-100).trim() || "unknown"}`);
+      const count = (s.best.match(/\b\d{1,3}\b/g) || []).length;
+      if (count >= 100) {
         // stable across two polls = the stream has ended
-        if (ints === lastInts) return (s.after.match(/\b\d{1,3}\b/g) || []).join(" ");
-        lastInts = ints;
+        if (count === lastInts) return s.best;
+        lastInts = count;
       }
     }
     log.warn("fingerprint-collect", "probe reply not captured; retrying", { variant, attempt: attempt + 1 });
