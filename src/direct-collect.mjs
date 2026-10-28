@@ -265,34 +265,16 @@ export class DirectCollector {
     for (let attempt = 0; ; attempt++) {
       const box = page.locator('textarea[placeholder="Ask anything…"]').last();
       await box.waitFor({ state: "visible", timeout: 90_000 }).catch(() => undefined);
-      // The fresh conversation view re-negotiates its own reCAPTCHA widget and
-      // the send button stays disabled until that settles — same trap as the
-      // Agent composer: "execute bound" is not "widget ready". Mint one token
-      // to force the negotiation, then poll (re-filling as needed) for up to
-      // ~90s before declaring the composer stuck.
-      await page
-        .evaluate(
-          ({ siteKey }) =>
-            new Promise((resolve) => {
-              try {
-                const mint = globalThis.grecaptcha?.enterprise?.execute(siteKey, { action: "chat_submit" });
-                if (mint && typeof mint.then === "function") mint.then(() => resolve("ok"), () => resolve("rejected"));
-                else resolve("unbound");
-              } catch {
-                resolve("threw");
-              }
-              setTimeout(() => resolve("timeout"), 60_000);
-            }),
-          { siteKey: this.siteKey }
-        )
-        .catch(() => undefined);
+      // NOTE: do NOT mint a token here. The Direct form gates its own send
+      // button on the page's reCAPTCHA widget, and an out-of-band execute
+      // occupies the widget, leaving the frontend's token fetch pending and
+      // the button disabled indefinitely (verified: fill works the moment the
+      // mint is skipped). Just fill, and keep re-filling: a fill landing while
+      // React is still hydrating the remounted view sets the DOM value without
+      // registering it in component state, and only a fresh input event fixes
+      // that. fill is idempotent, so re-apply until the button reacts.
       let enabled = false;
       for (let i = 0; i < 30 && !enabled; i++) {
-        // Re-fill every iteration: a fill that lands while React is still
-        // hydrating the remounted view sets the DOM value without registering
-        // it in component state, and the button stays disabled even though the
-        // textarea "has" text. fill is idempotent, so keep re-applying until
-        // the button reacts.
         await box.fill(prompt).catch(() => undefined);
         await page.waitForTimeout(3_000);
         enabled = await page
