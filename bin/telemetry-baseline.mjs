@@ -32,7 +32,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { ingestSnapshot, readBaseline, baselineSummary } from "../src/fingerprint/telemetry/baseline.mjs";
-import { readTaskRecords } from "../src/fingerprint/telemetry/capture.mjs";
+import { readTaskRecords, TASKS_FILE } from "../src/fingerprint/telemetry/capture.mjs";
 import { labelTasks, priorStatus, SIGMA_LOG, CONFIDENCE_THRESHOLD, MIN_LOG_MARGIN } from "../src/fingerprint/telemetry/identify.mjs";
 
 const [command, ...args] = process.argv.slice(2);
@@ -173,6 +173,10 @@ if (command === "label") {
     const source = tasksFile === "auto" ? null : tasksFile;
     const last = numberFlag("last", 20);
     const records = readTaskRecords(dataDir, { chain: flag("chain", ""), file: source });
+    if (!records.length) {
+      console.error(`no task records at ${source || path.join(dataDir, TASKS_FILE)} — the bridge writes them once real turns complete (ARENA_TELEMETRY_CAPTURE=0 disables that)`);
+      process.exit(0);
+    }
     tasks = records.slice(-last);
     console.error(`# labeling ${tasks.length} task record(s) from ${source || path.join(dataDir, TASKS_FILE)}`);
   } else {
