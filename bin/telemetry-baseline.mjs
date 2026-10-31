@@ -32,6 +32,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { ingestSnapshot, readBaseline, baselineSummary } from "../src/fingerprint/telemetry/baseline.mjs";
+import { readTaskRecords } from "../src/fingerprint/telemetry/capture.mjs";
 import { labelTasks, priorStatus, SIGMA_LOG, CONFIDENCE_THRESHOLD, MIN_LOG_MARGIN } from "../src/fingerprint/telemetry/identify.mjs";
 
 const [command, ...args] = process.argv.slice(2);
@@ -153,8 +154,10 @@ if (command === "show") {
 
 if (command === "label") {
   const file = args[0];
-  if (!file) {
-    console.error("usage: telemetry-baseline.mjs label <file|-> [--data dir] [--json] [--candidates \"a,b\"]");
+  const tasksFile = flag("tasks", "");
+  if (!file && !tasksFile) {
+    console.error("usage: telemetry-baseline.mjs label <file|-> [--data dir] [--json] [--candidates \"a,b\"]\n" +
+      "       telemetry-baseline.mjs label --tasks <jsonl|auto> [--chain substr] [--last 20]");
     process.exit(2);
   }
   const baseline = readBaseline(dataDir);
@@ -163,18 +166,29 @@ if (command === "label") {
     console.error(`baseline not usable (${prior.reason}); run fetch (or parse) first`);
     process.exit(1);
   }
-  let measurement;
-  try {
-    measurement = JSON.parse(readInput(file));
-  } catch (error) {
-    console.error(`measurement is not valid JSON: ${error.message}`);
-    process.exit(2);
+  let tasks;
+  if (tasksFile) {
+    // Task records the bridge captured passively (telemetry-tasks.jsonl).
+    // Their fields are the labeler's per-task input shape, so they pass through.
+    const source = tasksFile === "auto" ? null : tasksFile;
+    const last = numberFlag("last", 20);
+    const records = readTaskRecords(dataDir, { chain: flag("chain", ""), file: source });
+    tasks = records.slice(-last);
+    console.error(`# labeling ${tasks.length} task record(s) from ${source || path.join(dataDir, TASKS_FILE)}`);
+  } else {
+    let measurement;
+    try {
+      measurement = JSON.parse(readInput(file));
+    } catch (error) {
+      console.error(`measurement is not valid JSON: ${error.message}`);
+      process.exit(2);
+    }
+    // One task, { turns: [...] } for a multi-turn task, or { tasks: [...] } /
+    // an array for accumulation over a session's independent tasks.
+    tasks = Array.isArray(measurement)
+      ? measurement
+      : Array.isArray(measurement?.tasks) ? measurement.tasks : [measurement];
   }
-  // One task, { turns: [...] } for a multi-turn task, or { tasks: [...] } /
-  // an array for accumulation over a session's independent tasks.
-  const tasks = Array.isArray(measurement)
-    ? measurement
-    : Array.isArray(measurement?.tasks) ? measurement.tasks : [measurement];
   const candidates = (flag("candidates", "") || "").split(",").map((s) => s.trim()).filter(Boolean);
   const result = labelTasks(tasks, baseline, {
     candidates,
@@ -209,6 +223,8 @@ console.error(`usage:
   telemetry-baseline.mjs fetch                          pull the leaderboard via the logged-in browser
   telemetry-baseline.mjs parse <file|->                 ingest a saved snapshot (HTML or markdown)
   telemetry-baseline.mjs show [--model substr] [--json] print the stored baseline
-  telemetry-baseline.mjs label <file|->                 attribute one task's telemetry JSON
+  telemetry-baseline.mjs label <file|->                 attribute telemetry (JSON) to a model
+  telemetry-baseline.mjs label --tasks <jsonl|auto>     label captured task records instead
+       [--chain substr] [--last 20]                     of a measurement file
   options: --data <dir> (default ~/.arena-bridge)`);
 process.exit(2);

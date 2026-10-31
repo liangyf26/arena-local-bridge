@@ -105,6 +105,10 @@ export function loadConfig(env = {}, { requireBridgeKey = true } = {}) {
     // Only requests carrying an explicit identity are ever replayed, so re-asking
     // the same thing by hand always starts a new turn. 0 disables.
     resultCacheTtlMs: Number(env.ARENA_RESULT_CACHE_TTL_MS || 120_000),
+    // Passive per-task telemetry for the leaderboard-prior labeler — durations,
+    // output tokens and tool events recorded in passing to telemetry-tasks.jsonl.
+    // No extra Arena traffic; 0 disables the capture entirely.
+    telemetryCapture: String(env.ARENA_TELEMETRY_CAPTURE ?? "1") !== "0",
     // A public endpoint is published only while an explicitly enabled tunnel
     // is up. A loopback listener alone is never injected into Arena.
     mcpEndpointFile: env.ARENA_MCP_ENDPOINT_FILE || path.join(dataDir, "mcp-endpoint.json"),

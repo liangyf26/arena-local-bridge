@@ -15,6 +15,7 @@ import {
   repeatedToolGuard,
 } from "./parser.mjs";
 import { log, retry, maskTunnelUrl } from "./util.mjs";
+import { TelemetryCapture } from "./fingerprint/telemetry/capture.mjs";
 import { injectionPlan, mcpPreamble, WORKSPACE_HEADER, workspaceFromHeaders } from "./mcp-preamble.mjs";
 import { resolveWorkspace } from "./codex-workspace.mjs";
 import { decidePath } from "./path-guard.mjs";
@@ -146,6 +147,10 @@ export class Bridge {
     // §4.33 — short-lived idempotency cache: a client retry that arrives AFTER the
     // first run finished must not re-send the prompt to Arena.
     this.resultCache = new Map();
+    // Passive per-task telemetry for the model-identification prior. Observes
+    // completed turns in passing; failures inside it must never take a turn
+    // down (recordTurn swallows its own errors).
+    this.telemetry = new TelemetryCapture({ dataDir: config.dataDir, enabled: config.telemetryCapture !== false });
   }
 
   #mcpInjectedPath() {
@@ -1091,6 +1096,11 @@ export class Bridge {
                   const cur = nativeById.get(String(data.toolCallId)) || { id: String(data.toolCallId), name: "", rawInput: "" };
                   cur.name = String(data.toolName || cur.name || "");
                   cur.input = data.input;
+                  // An input that Arena's agent itself failed to produce is a
+                  // model-side failure — exactly what the leaderboard's bash
+                  // reliability counts. Kept on the call, not collapsed into
+                  // "available", so the telemetry capture can see it.
+                  if (data.type === "tool-input-error") cur.errored = true;
                   if (!native.some((c) => c.id === cur.id)) native.push(cur);
                 }
                 if (data.type === "finish") {
@@ -1294,6 +1304,7 @@ export class Bridge {
     // Resolved once, so the lease and the pages it protects always belong to the
     // same Account.
     const account = this.#credential();
+    const turnStartedAt = Date.now();
     // Held for the whole run, so a credential refresh mid-turn cannot rebuild
     // the context underneath it.
     return this.#serialized(() => this.browser.withAccount(account, async () => {
@@ -1387,7 +1398,18 @@ export class Bridge {
           this.runtime.duplicateBlocks += 1;
           return this.recoverFromDuplicate(page, body, prompt, guardedResult);
         }
-        return this.makeCompletion(body.model || "agent", "", nativeToolCalls, parsed.reasoning);
+        const completion = this.makeCompletion(body.model || "agent", "", nativeToolCalls, parsed.reasoning);
+        // Tool calls travel to the CLIENT here, so the task stays open until the
+        // results come back with the next request (or a user message cuts it).
+        this.telemetry.recordTurn({
+          chainKey: key,
+          kind: "agent",
+          body,
+          payload: completion,
+          outputText: "",
+          durationSec: (Date.now() - turnStartedAt) / 1000,
+        });
+        return completion;
       }
 
       state.lastNodeId = parsed.lastNodeId;
@@ -1402,7 +1424,17 @@ export class Bridge {
         return this.recoverFromDuplicate(page, body, prompt, guardedResult);
       }
       const content = textToolResult.content || (textToolResult.toolCalls ? "" : parsed.text || "(empty Agent response)");
-      return this.makeCompletion(body.model || "agent", content, textToolResult.toolCalls, parsed.reasoning);
+      const completion = this.makeCompletion(body.model || "agent", content, textToolResult.toolCalls, parsed.reasoning);
+      // Text closes the task; tool calls keep it open for the results request.
+      this.telemetry.recordTurn({
+        chainKey: key,
+        kind: "agent",
+        body,
+        payload: completion,
+        outputText: content,
+        durationSec: (Date.now() - turnStartedAt) / 1000,
+      });
+      return completion;
     }));
   }
 
@@ -1612,6 +1644,9 @@ export class Bridge {
         }
         return this.readLatestTurn(page, state, upstreamSink);
       };
+      // Telemetry clock: everything from here to the completion is the task's
+      // wall time — navigation, send, reads, tool-follow-ups.
+      const turnStartedAt = Date.now();
       let parsed;
       try {
         parsed = await runOnce();
@@ -1811,7 +1846,21 @@ export class Bridge {
 
       const content =
         parsed.text || (parsed.errorText ? `(Arena stream error: ${parsed.errorText})` : "(empty Agent response)");
-      return this.makeCompletion(body.model || "agent", content, null, "");
+      const completion = this.makeCompletion(body.model || "agent", content, null, "");
+      // One allow-mode call is one whole Arena task: the agent ran its tools
+      // internally and this is the final answer. The degenerate exits above
+      // (interactive ask_user, unmapped tools) are deliberately not recorded —
+      // they are aborted turns, not representative task work.
+      this.telemetry.recordTurn({
+        chainKey: sessionId,
+        kind: "converse",
+        body,
+        payload: completion,
+        nativeCalls: parsed.nativeCalls,
+        outputText: content,
+        durationSec: (Date.now() - turnStartedAt) / 1000,
+      });
+      return completion;
     }));
 
     this.inflight.set(inflightKey, work);
