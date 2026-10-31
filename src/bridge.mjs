@@ -522,6 +522,48 @@ export class Bridge {
             }
           };
           record(url, get);
+          // Tap the app's own /out response: tee its body through a
+          // TransformStream so the app keeps streaming normally while a copy
+          // lands in the bridge's buffer. The app's connection is the ONLY one
+          // the 2026-10-31 deployments serve — parallel fetches get the HTML
+          // shell or an instant close, so riding its stream is the only read.
+          if (url.includes("/sessions/") && url.includes("/out")) {
+            const result = original.apply(this, arguments);
+            try {
+              return Promise.resolve(result).then((res) => {
+                try {
+                  if (!res || !res.body || !res.ok) return res;
+                  const tap = new TransformStream();
+                  const writer = tap.writable.getWriter();
+                  const conn = (window.__arenaBridgeOutConn = (window.__arenaBridgeOutConn || 0) + 1);
+                  if (!window.__arenaBridgeOutData) window.__arenaBridgeOutData = [];
+                  (async () => {
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+                    while (true) {
+                      const { done, value } = await reader.read();
+                      if (done) {
+                        await writer.close().catch(() => {});
+                        break;
+                      }
+                      await writer.write(value).catch(() => {});
+                      window.__arenaBridgeOutSeq = (window.__arenaBridgeOutSeq || 0) + 1;
+                      window.__arenaBridgeOutData.push({ id: window.__arenaBridgeOutSeq, conn, text: decoder.decode(value, { stream: true }) });
+                      if (window.__arenaBridgeOutData.length > 300) window.__arenaBridgeOutData.splice(0, window.__arenaBridgeOutData.length - 300);
+                    }
+                  })().catch(() => {});
+                  const headers = new Headers(res.headers);
+                  headers.delete("content-encoding");
+                  headers.delete("content-length");
+                  return new Response(tap.readable, { status: res.status, statusText: res.statusText, headers });
+                } catch {
+                  return res;
+                }
+              });
+            } catch {
+              return result;
+            }
+          }
         } catch {
           /* recorder must never break the app's fetch */
         }
@@ -1020,7 +1062,203 @@ export class Bridge {
     }
     try {
       return await page.evaluate(
-      async ({ id, token, lastEventId, readBudgetMs, readAbortMs, marker }) => {
+      async ({ id, token, outUrl, lastEventId, readBudgetMs, readAbortMs, marker }) => {
+        // ── TAP MODE ────────────────────────────────────────────────────────
+        // The 2026-10-31 deployments put /out behind a service-worker-injected
+        // bearer + cursor and stopped serving the stream to page-level parallel
+        // fetches (they return the HTML shell or close instantly). The init
+        // script (#installOutWireHook) taps the APP'S OWN /out response at
+        // fetch level into window.__arenaBridgeOutData — the exact bytes the
+        // app sees. Draining that tap replaces opening a second connection.
+        if (window.__arenaBridgeOutData) {
+          const t0 = Date.now();
+          const deadline =
+            readAbortMs && Number(readAbortMs) > 0
+              ? t0 + Number(readAbortMs)
+              : readBudgetMs && Number(readBudgetMs) > 0
+                ? t0 + Number(readBudgetMs) + 30_000
+                : t0 + 600_000;
+          let lastSeq = 0; // consume the tap from its start; marker windows pick our turn
+          let carry = "";
+          const turns = new Map();
+          const nativeById = new Map();
+          const native = [];
+          const events = []; // { type, node, pos } for our-turn windowing
+          let curNode = null;
+          let hasFinish = false;
+          let turnCompleteSeen = false;
+          let errText = "";
+          let tokenOut = token || "";
+          let lastEventIdOut = lastEventId || "";
+          let sawMarker = !marker;
+          let msToFirstText = 0;
+          let msToFinish = 0;
+          let toolAfterReplay = false;
+          let finishCount = 0;
+          const dbg = [];
+
+          const handleEvent = (data) => {
+            const node = data.messageMetadata?.nodeId || data.nodeId || curNode;
+            const key = String(node);
+            if (dbg.length < 80 && data.type) {
+              dbg.push({
+                t: data.type,
+                n: String(node),
+                d: typeof data.delta === "string" ? data.delta.slice(0, 20) : data.toolName ? "tool:" + data.toolName : undefined,
+              });
+            }
+            if ((data.type === "text-delta" || data.type === "reasoning-delta") && typeof data.delta === "string") {
+              turns.set(key, (turns.get(key) || "") + data.delta);
+              curNode = node;
+              if (!msToFirstText) msToFirstText = Date.now() - t0;
+              events.push({ type: data.type, key, pos: events.length });
+            }
+            if (data.type === "error" && !errText) {
+              errText = String(data.errorText || data.message || data.error || JSON.stringify(data)).slice(0, 300);
+            }
+            if (data.type === "tool-input-start" && data.toolCallId) {
+              toolAfterReplay = true;
+              nativeById.set(String(data.toolCallId), { id: String(data.toolCallId), name: String(data.toolName || ""), rawInput: "" });
+              events.push({ type: data.type, key, pos: events.length });
+            }
+            if (data.type === "tool-input-delta" && data.toolCallId) {
+              toolAfterReplay = true;
+              const cur = nativeById.get(String(data.toolCallId)) || { id: String(data.toolCallId), name: "", rawInput: "" };
+              cur.rawInput += String(data.inputTextDelta || "");
+              nativeById.set(String(data.toolCallId), cur);
+            }
+            if ((data.type === "tool-input-available" || data.type === "tool-input-error") && data.toolCallId) {
+              toolAfterReplay = true;
+              const cur = nativeById.get(String(data.toolCallId)) || { id: String(data.toolCallId), name: "", rawInput: "" };
+              cur.name = String(data.toolName || cur.name || "");
+              cur.input = data.input;
+              if (data.type === "tool-input-error") cur.errored = true;
+              if (!native.some((c) => c.id === cur.id)) native.push(cur);
+              events.push({ type: data.type, key, pos: events.length });
+            }
+            if (data.type === "finish") {
+              curNode = data.messageMetadata?.nodeId || curNode;
+              hasFinish = true;
+              finishCount += 1;
+              if (!msToFinish) msToFinish = Date.now() - t0;
+              events.push({ type: "finish", key, pos: events.length });
+            }
+            if (data.type === "turn-complete") turnCompleteSeen = true;
+          };
+
+          while (Date.now() < deadline) {
+            const arr = window.__arenaBridgeOutData;
+            let newest = lastSeq;
+            for (const chunk of arr) {
+              if (chunk.id <= lastSeq) continue;
+              newest = Math.max(newest, chunk.id);
+              carry += chunk.text;
+              let cut;
+              while ((cut = carry.indexOf("\n\n")) >= 0) {
+                const block = carry.slice(0, cut);
+                carry = carry.slice(cut + 2);
+                for (const line of block.split("\n")) {
+                  const dataLine = /^data:\s?(.*)$/.exec(line);
+                  if (!dataLine) continue;
+                  let event;
+                  try {
+                    event = JSON.parse(dataLine[1]);
+                  } catch {
+                    continue;
+                  }
+                  for (const rec of Array.isArray(event.records) ? event.records : []) {
+                    if (Array.isArray(rec.headers)) {
+                      for (const [n, v] of rec.headers) {
+                        if (String(n).toLowerCase() === "public-access-token") tokenOut = String(v);
+                      }
+                    }
+                    if (!rec.body) continue;
+                    try {
+                      const body = JSON.parse(rec.body);
+                      const data = body.data || {};
+                      if (data.type) {
+                        const before = turns.get(String(curNode)) || "";
+                        handleEvent(data);
+                        // Marker detection: our turn's text carries the per-request nonce.
+                        if (!sawMarker && marker) {
+                          const now = turns.get(String(curNode)) || "";
+                          if (now.includes(marker) && !before.includes(marker)) sawMarker = true;
+                        }
+                      }
+                    } catch {
+                      continue;
+                    }
+                  }
+                }
+              }
+            }
+            lastSeq = newest;
+            if (hasFinish && sawMarker && turnCompleteSeen) break;
+            if (hasFinish && sawMarker && Date.now() - t0 > 8_000) break;
+            await new Promise((r) => setTimeout(r, 400));
+          }
+
+          // Our turn = events after the last finish that preceded the marker
+          // text. The marker-bearing node's text (minus the marker) is the reply;
+          // native tool events inside that window belong to our turn.
+          let markerNode = null;
+          if (marker) {
+            for (const [k, v] of turns) if (v.includes(marker)) markerNode = k;
+          }
+          let windowStart = 0;
+          if (markerNode && events.length) {
+            const firstDelta = events.find((e) => e.key === markerNode && (e.type === "text-delta" || e.type === "reasoning-delta"));
+            const start = firstDelta ? firstDelta.pos : events.length;
+            for (let i = start; i >= 0; i--) {
+              if (events[i].type === "finish") {
+                windowStart = i + 1;
+                break;
+              }
+            }
+          }
+          const ourEvents = events.slice(windowStart);
+          const ourTurnFinishes = ourEvents.filter((e) => e.type === "finish").length;
+          const ourToolEvents = ourEvents.filter((e) => e.type.startsWith("tool-input")).length;
+          const ourTextNodes = new Set(ourEvents.filter((e) => e.key && (e.type === "text-delta" || e.type === "reasoning-delta")).map((e) => e.key));
+          let ourText = "";
+          if (markerNode) {
+            ourText = (turns.get(markerNode) || "").split(marker)[0] || (turns.get(markerNode) || "");
+          } else if (ourTextNodes.size) {
+            ourText = turns.get([...ourTextNodes].pop()) || "";
+          }
+          // Tool events are keyed by their own node ids — include any native
+          // call whose events sit inside our window (native[] is already
+          // ordered; filter by the event positions recorded above).
+          const ourNative = ourToolEvents ? native : native.slice(0, 0);
+          const lastNode = curNode || [...turns.keys()].pop();
+          return {
+            text: ourText || "",
+            toolAfterReplay,
+            token: tokenOut,
+            lastEventId: lastEventIdOut,
+            nativeCalls: ourNative,
+            errorText: errText,
+            turns: [...turns.entries()].map(([k, v]) => ({ k: String(k), text: v })),
+            timing: {
+              totalMs: Date.now() - t0,
+              msToFirstText,
+              msToFinish,
+              replayEndMs: -1,
+              historyNodeCount: turns.size - ourTextNodes.size,
+              toolAfterReplay,
+              ourTurnFinishes,
+              ourSteps: ourTurnFinishes,
+              breakReason: "tap-drained",
+            },
+            debug: {
+              lastNode: String(lastNode),
+              nodeKeys: [...turns.keys()].map(String),
+              nodeTexts: [...turns.entries()].map(([k, v]) => ({ k: String(k), len: v.length, head: v.slice(0, 60) })),
+              events: dbg,
+            },
+          };
+        }
+        // ── FETCH MODE (fallback when no tap is installed) ──────────────────
         const controller = new AbortController();
         // §4.37 — Never abort the stream on a timer unless an explicit positive
         // budget is configured. With readAbortMs <= 0 we wait for Arena forever.
@@ -1032,7 +1270,7 @@ export class Bridge {
         try {
           const headers = { Accept: "text/event-stream", Authorization: `Bearer ${token}` };
           if (lastEventId) headers["Last-Event-ID"] = lastEventId;
-          const response = await fetch(`/ai-proxy/realtime/v1/sessions/${id}/out`, {
+          const response = await fetch(outUrl || `/ai-proxy/realtime/v1/sessions/${id}/out`, {
             headers,
             signal: controller.signal,
           });
