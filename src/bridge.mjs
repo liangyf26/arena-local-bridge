@@ -792,11 +792,17 @@ export class Bridge {
     );
     let observedToken = "";
     let observedOutUrl = "";
+    let observedLastEventId = "";
     const tokenListener = (request) => {
       if (sessionUrlMatches(request.url()) && request.url().includes("/out")) {
         // Remember the /out URL shape the app itself uses — readLatestTurn must
-        // reuse it, because the bare-uuid form is rejected with 403 now.
+        // reuse it, because the bare-uuid form is rejected with 403 now. The
+        // app's Last-Event-ID cursor is equally load-bearing: since the
+        // agent-runner form landed, /out closes instantly (200, empty body)
+        // when opened WITHOUT that cursor, so the read must resume from where
+        // the app's own connection is, not replay from scratch.
         if (!observedOutUrl) observedOutUrl = request.url();
+        if (!observedLastEventId) observedLastEventId = request.headers()["last-event-id"] || "";
         const auth = request.headers().authorization || "";
         if (/^Bearer /i.test(auth)) observedToken = auth.replace(/^Bearer /i, "");
       }
@@ -849,6 +855,7 @@ export class Bridge {
     if (!observedToken && headerToken) observedToken = headerToken;
     if (observedToken) state.token = observedToken;
     if (observedOutUrl) state.outUrl = observedOutUrl;
+    if (observedLastEventId && !state.lastEventId) state.lastEventId = observedLastEventId;
   }
 
   async refreshAgentToken(page, id) {
