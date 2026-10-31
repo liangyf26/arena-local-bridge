@@ -32,9 +32,26 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { readBaseline } from "./telemetry/baseline.mjs";
 import { readTaskRecords } from "./telemetry/capture.mjs";
 import { labelTasks } from "./telemetry/identify.mjs";
+
+/**
+ * Builtin alias map: bank/API model ids → canonical leaderboard classes.
+ * Needed where containment alignment cannot decide — two leaderboard
+ * snapshots share a prefix ("DeepSeek-V4.1-Flash-20261017/-20260910"), and
+ * effort-suffixed API ids ("claude-sonnet-5-5-high") name a relay tier, not
+ * a leaderboard suffix. Edit this file as the bank grows; opts.aliases
+ * (ensemble-cli --aliases) merges over it.
+ */
+const BUILTIN_ALIASES = JSON.parse(
+  fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "model-aliases.json"), "utf8")
+);
+
+export function builtinAliases() {
+  return { ...BUILTIN_ALIASES };
+}
 
 /**
  * Per-signal reliability weights. The numeric fingerprint is worth two
@@ -102,7 +119,7 @@ export function fuseVotes(signals, canonicalNames, opts = {}) {
     return failedFusion("no canonical classes — is the leaderboard baseline loaded?", opts);
   }
   const weights = { ...DEFAULT_WEIGHTS, ...(opts.weights || {}) };
-  const aliases = opts.aliases || {};
+  const aliases = { ...BUILTIN_ALIASES, ...(opts.aliases || {}) };
   const notes = [];
 
   // Align every vote onto the canonical space; duplicates within a signal add.

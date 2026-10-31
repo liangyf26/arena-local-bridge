@@ -18,6 +18,7 @@ import {
   alignName,
   fuseVotes,
   telemetryVoteFromTasks,
+  builtinAliases,
   appendVote,
   readVotes,
   votesPath,
@@ -43,6 +44,28 @@ test("alignment: exact normalized, alias, unique containment", () => {
   assert.equal(alignName("gpt-6 luna", CANON), null);
   assert.equal(alignName("some model that never shipped", CANON), null);
   assert.equal(alignName("", CANON), null);
+});
+
+test("builtin aliases resolve bank ids containment cannot", () => {
+  const withSnapshots = [...CANON, "DeepSeek-V4.1-Flash-20261017 (Max)", "DeepSeek-V4.1-Flash-20260910 (Max)"];
+  // Two snapshots share the prefix — containment is ambiguous, the alias decides.
+  assert.equal(alignName("deepseek-v4.1-flash", withSnapshots), null);
+  assert.equal(
+    alignName("deepseek-v4.1-flash", withSnapshots, builtinAliases()),
+    "DeepSeek-V4.1-Flash-20261017 (Max)",
+  );
+  // An effort-suffixed relay id names no leaderboard suffix on its own.
+  const withSonnet = [...CANON, "Claude Sonnet 5.5 (Max)"];
+  assert.equal(alignName("claude-sonnet-5-5-high", withSonnet), null);
+  assert.equal(alignName("claude-sonnet-5-5-high", withSonnet, builtinAliases()), "Claude Sonnet 5.5 (Max)");
+  // fuseVotes picks the builtin map up without being told.
+  const fused = fuseVotes(
+    [{ signal: "numeric", votes: [{ model: "deepseek-v4.1-flash", posterior: 0.9 }] }],
+    withSnapshots,
+    { minAgree: 1 },
+  );
+  assert.equal(fused.status, "attributed");
+  assert.equal(fused.model, "DeepSeek-V4.1-Flash-20261017 (Max)");
 });
 
 // ── fusion math ──────────────────────────────────────────────────────────

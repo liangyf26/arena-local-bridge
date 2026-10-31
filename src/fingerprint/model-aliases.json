@@ -1,0 +1,11 @@
+{
+  "deepseek-v4.1-flash": "DeepSeek-V4.1-Flash-20261017 (Max)",
+  "claude-sonnet-5-5-high": "Claude Sonnet 5.5 (Max)",
+  "claude-opus-5-5-high": "Claude Opus 5.5 (Max)",
+  "claude-fable-5-1-high": "Claude Fable 5.1 (Max)",
+  "claude-fable-5-high": "Claude Fable 5 (High)",
+  "kimi-k3.1-pro": "Kimi K3.1 Pro (Max)",
+  "gpt-6-astra": "GPT-6 Astra (Max)",
+  "gemini-4-argon": "Gemini 4 Argon (High)",
+  "glm-5.3-flash": "GLM-5.3-Flash"
+}
