@@ -781,20 +781,29 @@ export class Bridge {
       if (!filled) await page.waitForTimeout(1_000);
     }
     log.info("bridge", "append composer prepared", { sessionId: state.id, filled });
+    // Arena's app now addresses sessions as `agent-runner%3A<uuid>` on the wire
+    // (2026-10-31 deployment), so the id appears percent-encoded inside the URL.
+    // Match on the bare uuid — it is a substring of the encoded form — instead
+    // of the full `/sessions/<id>/...` path, which no longer occurs verbatim.
+    const sessionUrlMatches = (url) => url.includes("/sessions/") && url.includes(state.id);
     const appendResponse = page.waitForResponse(
-      (response) => response.url().includes(`/sessions/${state.id}/in/append`),
+      (response) => response.url().includes("/in/append") && sessionUrlMatches(response.url()),
       { timeout: this.config.composerWaitMs }
     );
     let observedToken = "";
+    let observedOutUrl = "";
     const tokenListener = (request) => {
-      if (request.url().includes(`/sessions/${state.id}/out`)) {
+      if (sessionUrlMatches(request.url()) && request.url().includes("/out")) {
+        // Remember the /out URL shape the app itself uses — readLatestTurn must
+        // reuse it, because the bare-uuid form is rejected with 403 now.
+        if (!observedOutUrl) observedOutUrl = request.url();
         const auth = request.headers().authorization || "";
         if (/^Bearer /i.test(auth)) observedToken = auth.replace(/^Bearer /i, "");
       }
     };
     page.on("request", tokenListener);
     const freshOutputRequest = page
-      .waitForRequest((request) => request.url().includes(`/sessions/${state.id}/out`), { timeout: 12_000 })
+      .waitForRequest((request) => sessionUrlMatches(request.url()) && request.url().includes("/out"), { timeout: 12_000 })
       .catch(() => null);
     // Submit by clicking the real "Send message" / "发送消息" button (matched by
     // text label, exactly like the Arena模型助手 PageBridge/PelicanSend). This lets
@@ -835,6 +844,7 @@ export class Bridge {
     const headerToken = response.headers()["public-access-token"] || "";
     if (headerToken) observedToken = headerToken;
     if (observedToken) state.token = observedToken;
+    if (observedOutUrl) state.outUrl = observedOutUrl;
   }
 
   async refreshAgentToken(page, id) {
@@ -844,7 +854,7 @@ export class Bridge {
 
   async readAgentOutput(page, state) {
     const result = await page.evaluate(
-      async ({ id, token, lastEventId, readBudgetMs }) => {
+      async ({ id, token, outUrl, lastEventId, readBudgetMs }) => {
         const controller = new AbortController();
         let timer = null;
         // §4.37 — 0 / unset budget means "wait forever"; only arm the abort timer
@@ -856,7 +866,9 @@ export class Bridge {
         try {
           const headers = { Accept: "text/event-stream", Authorization: `Bearer ${token}` };
           if (lastEventId) headers["Last-Event-ID"] = lastEventId;
-          const response = await fetch(`/ai-proxy/realtime/v1/sessions/${id}/out`, {
+          // The app addresses /out as agent-runner%3A<uuid> now; reuse the URL
+          // shape captured from its own request, falling back to the bare uuid.
+          const response = await fetch(outUrl || `/ai-proxy/realtime/v1/sessions/${id}/out`, {
             headers,
             signal: controller.signal,
           });
@@ -883,7 +895,7 @@ export class Bridge {
           await reader?.cancel().catch(() => undefined);
         }
       },
-      { id: state.id, token: state.token, lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "" }
+      { id: state.id, token: state.token, outUrl: state.outUrl || "", lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "" }
     );
     if (result.status !== 200)
       throw Object.assign(new Error(`Arena Agent output failed: ${result.status}`), { status: result.status });
@@ -1197,7 +1209,7 @@ export class Bridge {
           await reader?.cancel().catch(() => undefined);
         }
       },
-      { id: state.id, token: state.token, lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "" }
+      { id: state.id, token: state.token, outUrl: state.outUrl || "", lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "" }
       );
     } finally {
       if (sinkActive) this._deltaSink = null;
