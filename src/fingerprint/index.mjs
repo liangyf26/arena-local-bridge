@@ -141,6 +141,7 @@ export async function identify({ dataDir, variant, ask, expectedCount = PROBE_CO
         `${result.margin.toFixed(2)} margin; below the required ${requiredMargin.toFixed(2)} margin ` +
         `or ${(threshold * 100).toFixed(1)}% confidence gate`,
       rawScores: result.rawScores,
+      posterior: result.posterior,
     };
   }
   return {
@@ -149,6 +150,7 @@ export async function identify({ dataDir, variant, ask, expectedCount = PROBE_CO
     confidence: result.confidence,
     margin: result.margin,
     rawScores: result.rawScores,
+    posterior: result.posterior,
     reason: null,
   };
 }

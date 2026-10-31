@@ -141,16 +141,26 @@ export function fuseVotes(signals, canonicalNames, opts = {}) {
     return failedFusion("no signal produced an aligned vote" + (notes.length ? ` — ${notes.join("; ")}` : ""), opts, notes);
   }
 
+  // One vote per signal per session: a later vote replaces an earlier one.
+  // Re-running a probe supersedes its result, and counting a signal twice
+  // would inflate the agreement gate without adding independent evidence.
+  const byName = new Map();
+  for (const s of aligned) {
+    if (byName.has(s.signal)) notes.push(`${s.signal}: an earlier vote was replaced by a later one`);
+    byName.set(s.signal, s);
+  }
+  const deduped = [...byName.values()];
+
   // A class outside a signal's support is scored at that signal's mean
   // log-vote, so abstention neither helps nor hurts (see module header).
-  for (const s of aligned) {
+  for (const s of deduped) {
     s.meanLog = [...s.logVotes.values()].reduce((a, b) => a + b, 0) / s.logVotes.size;
   }
   const carried = [];
   for (const name of canonicalNames) {
     let score = 0;
     let seenBy = 0;
-    for (const s of aligned) {
+    for (const s of deduped) {
       const own = s.logVotes.get(name);
       score += s.weight * (own !== undefined ? own : s.meanLog);
       if (own !== undefined) seenBy += 1;
@@ -177,8 +187,8 @@ export function fuseVotes(signals, canonicalNames, opts = {}) {
   const confidence = top.posterior;
 
   // Agreement: which signals' own top pick equals the fused top pick?
-  const agreeing = aligned.filter((s) => s.top === top.model).map((s) => s.signal);
-  const disagreeing = aligned.filter((s) => s.top !== top.model).map((s) => ({ signal: s.signal, top: s.top }));
+  const agreeing = deduped.filter((s) => s.top === top.model).map((s) => s.signal);
+  const disagreeing = deduped.filter((s) => s.top !== top.model).map((s) => ({ signal: s.signal, top: s.top }));
   const minAgree = Math.max(1, Math.floor(opts.minAgree ?? DEFAULT_MIN_AGREE));
   const threshold = opts.threshold ?? CONFIDENCE_THRESHOLD;
   const minLogMargin = opts.minLogMargin ?? MIN_LOG_MARGIN;
@@ -187,17 +197,17 @@ export function fuseVotes(signals, canonicalNames, opts = {}) {
   let model = null;
   let nearMiss = null;
   let reason = null;
-  if (aligned.length < minAgree) {
+  if (deduped.length < minAgree) {
     status = "unresolved";
     nearMiss = top.model;
     reason =
-      `${aligned.length} signal(s) voted; the agreement gate needs ${minAgree} — ` +
+      `${deduped.length} signal(s) voted; the agreement gate needs ${minAgree} — ` +
       `a single signal must never carry a label alone`;
   } else if (agreeing.length < minAgree) {
     status = "unresolved";
     nearMiss = top.model;
     reason =
-      `top guess ${top.model} agreed by ${agreeing.length}/${aligned.length} signal(s) ` +
+      `top guess ${top.model} agreed by ${agreeing.length}/${deduped.length} signal(s) ` +
       `(needs ${minAgree}); disagreeing: ${disagreeing.map((d) => `${d.signal}→${d.top}`).join(", ") || "none"}`;
   } else if (confidence < threshold || margin < minLogMargin) {
     status = "unresolved";
@@ -224,7 +234,7 @@ export function fuseVotes(signals, canonicalNames, opts = {}) {
       agreeing,
       disagreeing,
     },
-    signals: aligned.map((s) => ({
+    signals: deduped.map((s) => ({
       signal: s.signal,
       weight: s.weight,
       visibleClasses: s.visible,

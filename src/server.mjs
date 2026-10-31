@@ -22,6 +22,7 @@ import { BatchTest } from "./batchtest.mjs";
 import { DirectCollector } from "./direct-collect.mjs";
 import { readSnapshot } from "./probe/index.mjs";
 import { identify, bankStatus, variantIds, probePrompt } from "./fingerprint/index.mjs";
+import { appendVote } from "./fingerprint/ensemble.mjs";
 import { VERSION } from "./version.mjs";
 import {
   bind,
@@ -156,6 +157,31 @@ export async function runFingerprintReprobe({ bridge, sessionId, accountEmail, d
         },
       })
     );
+    // The numeric signal votes here, automatically. The probe cost a turn and
+    // produced a posterior over the bank — that is evidence the ensemble can
+    // fuse, whether or not the fingerprint cleared its own margin gate (a
+    // near-miss still ranks the bank's models). Only a FAILED fingerprint has
+    // nothing to say. Recording must never fail the reprobe report.
+    if (outcome?.posterior && Object.keys(outcome.posterior).length > 0) {
+      try {
+        appendVote(dataDir, {
+          sessionId,
+          signal: "numeric",
+          votes: Object.entries(outcome.posterior).map(([model, posterior]) => ({ model, posterior })),
+          notes: [
+            `status=${outcome.status}`,
+            outcome.model ? `top=${outcome.model}` : `nearMiss=${outcome.nearMiss}`,
+            `margin=${outcome.margin?.toFixed?.(3)}`,
+            ...(variant ? [`variant=${variant}`] : []),
+          ],
+        });
+      } catch (error) {
+        log.warn("server", "fingerprint reprobe: recording the ensemble vote failed (reprobe result unaffected)", {
+          sessionId,
+          message: String(error?.message || error).slice(0, 160),
+        });
+      }
+    }
     return { outcome, failure: null };
   } catch (error) {
     return { outcome: null, failure: error instanceof Error ? error.message : String(error) };

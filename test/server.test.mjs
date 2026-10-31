@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { validateCompletion, RateLimiter, exposesBridgeKey, allowedHosts, runReprobe, runFingerprintReprobe, extractCompletionText } from "../src/server.mjs";
+import { readVotes } from "../src/fingerprint/ensemble.mjs";
 import { appendRecord } from "../src/fingerprint/bank-store.mjs";
 import fs from "node:fs";
 import os from "node:os";
@@ -306,6 +307,53 @@ test("runFingerprintReprobe: a reply matching nothing comes back unresolved with
   assert.equal(outcome.status, "unresolved");
   assert.equal(outcome.model, null, "an unresolved reprobe must not name a model");
   assert.ok(outcome.nearMiss);
+});
+
+test("runFingerprintReprobe: the numeric signal votes automatically, attributed or not", async () => {
+  // Attributed reprobe → one numeric vote over the bank's models, top = m1.
+  const attributedDir = seededBankDir();
+  const { outcome } = await runFingerprintReprobe({
+    bridge: fingerprintBridge(REPLY_FOR(70, 99)),
+    sessionId: "s-vote",
+    accountEmail: OWNER.email,
+    dataDir: attributedDir,
+    variant: "v1-instant",
+  });
+  assert.equal(outcome.status, "attributed");
+  const votes = readVotes(attributedDir, { sessionId: "s-vote" });
+  assert.equal(votes.length, 1);
+  assert.equal(votes[0].signal, "numeric");
+  assert.equal(votes[0].votes.length, 2); // the bank has two models
+  const top = votes[0].votes.reduce((a, b) => (b.posterior > a.posterior ? b : a));
+  assert.equal(top.model, outcome.model);
+  assert.ok(Math.abs(votes[0].votes.reduce((s, v) => s + v.posterior, 0) - 1) < 1e-9);
+  assert.ok(votes[0].notes.some((n) => n.includes("status=attributed")));
+
+  // Unresolved reprobe → still votes (a near-miss ranks the bank), with the
+  // status in the notes so the ensemble can see the gate was not cleared.
+  const unresolvedDir = seededBankDir();
+  const { outcome: unresolved } = await runFingerprintReprobe({
+    bridge: fingerprintBridge(FLAT_REPLY),
+    sessionId: "s-vote-2",
+    accountEmail: OWNER.email,
+    dataDir: unresolvedDir,
+    variant: "v1-instant",
+  });
+  assert.equal(unresolved.status, "unresolved");
+  const nearVotes = readVotes(unresolvedDir, { sessionId: "s-vote-2" });
+  assert.equal(nearVotes.length, 1);
+  assert.ok(nearVotes[0].notes.some((n) => n.includes("status=unresolved")));
+
+  // A FAILED reprobe (no bank) says nothing — no vote, no file noise.
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "arena-fpnovote-"));
+  await runFingerprintReprobe({
+    bridge: fingerprintBridge(REPLY_FOR(70)),
+    sessionId: "s-vote-3",
+    accountEmail: OWNER.email,
+    dataDir: empty,
+    variant: "v1-instant",
+  });
+  assert.equal(readVotes(empty, { sessionId: "s-vote-3" }).length, 0);
 });
 
 test("runFingerprintReprobe: no bank means no turn is spent", async () => {

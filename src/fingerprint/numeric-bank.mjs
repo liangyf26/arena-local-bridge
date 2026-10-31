@@ -141,12 +141,20 @@ export function attribute(text, bank, { expectedCount, beta = 3 } = {}) {
   const probabilities = softmax(standardize(raw).map((s) => beta * s));
   let best = 0;
   for (let i = 1; i < probabilities.length; i++) if (probabilities[i] > probabilities[best]) best = i;
+  // The same posterior keyed by model id — the ensemble's vote shape. Kept
+  // alongside `probabilities` because the array only makes sense next to
+  // bank.modelIds, which callers should not have to know about.
+  const posterior = {};
+  bank.modelIds.forEach((id, i) => {
+    posterior[id] = probabilities[i];
+  });
   return {
     model: bank.modelIds[best],
     confidence: probabilities[best],
     rawScores: raw,
     margin: marginOf(raw),
     probabilities,
+    posterior,
   };
 }
 

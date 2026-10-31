@@ -71,6 +71,23 @@ test("one signal alone can never carry a label", () => {
   assert.equal(relaxed.model, "GPT-6 Luna (Low)");
 });
 
+test("a repeated signal vote replaces the earlier one instead of inflating agreement", () => {
+  // Two numeric votes (a re-run probe) agreeing with each other, telemetry
+  // disagreeing: counting numeric twice would fake a 2/3 agreement. The later
+  // vote must REPLACE the earlier one — and win against the stale one.
+  const telemetry = { signal: "telemetry", weight: 1, votes: [{ model: "GLM-5.3-Flash", posterior: 0.9 }, { model: "GPT-6 Luna (Low)", posterior: 0.1 }] };
+  const numericOld = { signal: "numeric", weight: 1, votes: [{ model: "GPT-6 Luna (Low)", posterior: 0.95 }, { model: "GLM-5.3-Flash", posterior: 0.05 }] };
+  const numericNew = { signal: "numeric", weight: 1, votes: [{ model: "GLM-5.3-Flash", posterior: 0.9 }, { model: "GPT-6 Luna (Low)", posterior: 0.1 }] };
+  const result = fuseVotes([telemetry, numericOld, numericNew], CANON, { minAgree: 1 });
+  assert.equal(result.signals.length, 2); // numeric appears once
+  assert.ok(result.notes.some((n) => n.includes("numeric") && n.includes("replaced")));
+  // With the OLD vote counted, numeric+telemetry would have disagreed;
+  // with the NEW vote, both agree on GLM — attributed, not unresolved.
+  assert.equal(result.status, "attributed");
+  assert.equal(result.model, "GLM-5.3-Flash");
+  assert.deepEqual(result.agreement.agreeing, ["telemetry", "numeric"]);
+});
+
 test("disagreement blocks attribution and is surfaced", () => {
   // Explicit unit weights: the point is the disagreement logic, not the
   // reliability dial (numeric defaults to weight 2, which would tilt the fusion).
