@@ -495,30 +495,60 @@ export class Bridge {
     this.#outWireHookPages.add(page);
     await page.addInitScript(() => {
       window.__arenaBridgeOutWire = { url: "", auth: "", lastEventId: "" };
+      const record = (url, getHeader) => {
+        try {
+          if (String(url).includes("/sessions/") && String(url).includes("/out")) {
+            window.__arenaBridgeOutWire = {
+              url: String(url),
+              auth: String(getHeader("authorization") || getHeader("Authorization") || ""),
+              lastEventId: String(getHeader("last-event-id") || getHeader("Last-Event-ID") || ""),
+            };
+          }
+        } catch {
+          /* recorder must never break the app's request */
+        }
+      };
       const original = window.fetch;
       window.fetch = function (input, init) {
         try {
           const url = typeof input === "string" ? input : (input && input.url) || "";
-          if (url.includes("/sessions/") && url.includes("/out")) {
-            const headers = (init && init.headers) || (input && input.headers) || {};
-            const get = (key) => {
-              try {
-                if (typeof headers.get === "function") return headers.get(key) || "";
-                return headers[key] || headers[key.toLowerCase()] || "";
-              } catch {
-                return "";
-              }
-            };
-            window.__arenaBridgeOutWire = {
-              url: String(url),
-              auth: String(get("authorization")),
-              lastEventId: String(get("last-event-id")),
-            };
-          }
+          const headers = (init && init.headers) || (input && input.headers) || {};
+          const get = (key) => {
+            try {
+              if (typeof headers.get === "function") return headers.get(key) || "";
+              return headers[key] || headers[key.toLowerCase()] || "";
+            } catch {
+              return "";
+            }
+          };
+          record(url, get);
         } catch {
           /* recorder must never break the app's fetch */
         }
         return original.apply(this, arguments);
+      };
+      // The app may use XHR for the realtime stream — Playwright's request
+      // events see both, so the recorder must too.
+      const OriginalXHR = window.XMLHttpRequest;
+      const originalOpen = OriginalXHR.prototype.open;
+      const originalSetHeader = OriginalXMLHttpRequest.prototype.setRequestHeader;
+      OriginalXMLHttpRequest.prototype.open = function (method, url) {
+        this.__arenaBridgeUrl = url;
+        this.__arenaBridgeHeaders = {};
+        return originalOpen.apply(this, arguments);
+      };
+      OriginalXMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        try {
+          if (this.__arenaBridgeHeaders) this.__arenaBridgeHeaders[String(name).toLowerCase()] = value;
+        } catch {}
+        return originalSetHeader.apply(this, arguments);
+      };
+      const originalSend = OriginalXHR.prototype.send;
+      OriginalXMLHttpRequest.prototype.send = function () {
+        try {
+          if (this.__arenaBridgeUrl) record(this.__arenaBridgeUrl, (k) => this.__arenaBridgeHeaders[String(k).toLowerCase()] || "");
+        } catch {}
+        return originalSend.apply(this, arguments);
       };
     });
   }
