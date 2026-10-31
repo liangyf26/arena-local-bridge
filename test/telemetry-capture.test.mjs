@@ -24,7 +24,7 @@ const completion = (content, toolCalls = null) => ({
 });
 
 /** A real Bridge whose page half is mocked — converse() costs no browser. */
-function makeBridge({ telemetryCapture = true } = {}) {
+function makeBridge({ telemetryCapture = true, turnResult } = {}) {
   const dataDir = tmpDir();
   const config = {
     dataDir,
@@ -56,12 +56,12 @@ function makeBridge({ telemetryCapture = true } = {}) {
   });
   bridge.browser = { withAccount: async (_account, fn) => fn(), getPage: async () => ({}) };
   bridge.appendAgentMessage = async () => {};
-  bridge.readLatestTurn = async () => ({
+  bridge.readLatestTurn = async () => turnResult ?? {
     text: "Task complete, 42 files checked.",
     nativeCalls: [{ id: "t1", name: "bash", rawInput: '{"command":"ls"}' }],
     turns: [],
     timing: { breakReason: "turn+marker" },
-  });
+  };
   return { bridge, dataDir };
 }
 
@@ -90,6 +90,21 @@ test("the capture switch turns the wiring off cleanly", async () => {
   assert.equal(bridge.telemetry.enabled, false);
   await bridge.converse(SESSION, { model: SESSION, messages: [{ role: "user", content: "check things" }] });
   assert.equal(readTaskRecords(dataDir).length, 0);
+});
+
+test("a stream-error turn is not recorded — Arena failures are not model behaviour", async () => {
+  const { bridge, dataDir } = makeBridge({
+    turnResult: { text: "", errorText: "recaptcha validation failed", nativeCalls: [], turns: [], timing: {} },
+  });
+  const payload = await bridge.converse(SESSION, { model: SESSION, messages: [{ role: "user", content: "hi" }] });
+  assert.ok(payload?.choices?.[0]?.message?.content.includes("Arena stream error"));
+  assert.equal(readTaskRecords(dataDir).length, 0);
+  // And neither is an empty read.
+  const { bridge: b2, dataDir: dir2 } = makeBridge({
+    turnResult: { text: "", nativeCalls: [], turns: [], timing: {} },
+  });
+  await b2.converse(SESSION, { model: SESSION, messages: [{ role: "user", content: "hi" }] });
+  assert.equal(readTaskRecords(dir2).length, 0);
 });
 
 test("shell failure heuristic: exit codes and tracebacks, not the word error alone", () => {

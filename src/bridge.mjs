@@ -1426,14 +1426,18 @@ export class Bridge {
       const content = textToolResult.content || (textToolResult.toolCalls ? "" : parsed.text || "(empty Agent response)");
       const completion = this.makeCompletion(body.model || "agent", content, textToolResult.toolCalls, parsed.reasoning);
       // Text closes the task; tool calls keep it open for the results request.
-      this.telemetry.recordTurn({
-        chainKey: key,
-        kind: "agent",
-        body,
-        payload: completion,
-        outputText: content,
-        durationSec: (Date.now() - turnStartedAt) / 1000,
-      });
+      // A turn with neither a reply nor tool calls (empty read) is an Arena
+      // failure, not model behaviour — skip it.
+      if (textToolResult.toolCalls || (parsed.text || "").trim()) {
+        this.telemetry.recordTurn({
+          chainKey: key,
+          kind: "agent",
+          body,
+          payload: completion,
+          outputText: content,
+          durationSec: (Date.now() - turnStartedAt) / 1000,
+        });
+      }
       return completion;
     }));
   }
@@ -1848,18 +1852,22 @@ export class Bridge {
         parsed.text || (parsed.errorText ? `(Arena stream error: ${parsed.errorText})` : "(empty Agent response)");
       const completion = this.makeCompletion(body.model || "agent", content, null, "");
       // One allow-mode call is one whole Arena task: the agent ran its tools
-      // internally and this is the final answer. The degenerate exits above
-      // (interactive ask_user, unmapped tools) are deliberately not recorded —
-      // they are aborted turns, not representative task work.
-      this.telemetry.recordTurn({
-        chainKey: sessionId,
-        kind: "converse",
-        body,
-        payload: completion,
-        nativeCalls: parsed.nativeCalls,
-        outputText: content,
-        durationSec: (Date.now() - turnStartedAt) / 1000,
-      });
+      // internally and this is the final answer. Degenerate exits above
+      // (interactive ask_user, unmapped tools) and turns that never produced a
+      // real reply (stream errors, empty reads — Arena-side failures, not
+      // model behaviour) are deliberately not recorded: their durations and
+      // token counts would poison the prior with non-task noise.
+      if ((parsed.text || "").trim()) {
+        this.telemetry.recordTurn({
+          chainKey: sessionId,
+          kind: "converse",
+          body,
+          payload: completion,
+          nativeCalls: parsed.nativeCalls,
+          outputText: content,
+          durationSec: (Date.now() - turnStartedAt) / 1000,
+        });
+      }
       return completion;
     }));
 
