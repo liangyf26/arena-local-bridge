@@ -475,7 +475,52 @@ export class Bridge {
    * default pick, which is what the session-creating flows want.
    */
   async #page(account, purpose) {
-    return this.browser.getPage(account || this.#credential(), purpose);
+    const page = await this.browser.getPage(account || this.#credential(), purpose);
+    // Arm the /out wire recorder BEFORE the app loads: the app's realtime
+    // connection (carrying the /out cursor + bearer the reads need) opens at
+    // page load, and a listener attached later can never see it.
+    await this.#installOutWireHook(page).catch(() => undefined);
+    return page;
+  }
+
+  #outWireHookPages = new WeakSet();
+
+  /**
+   * Wrap window.fetch on the session page so the app's own /out request —
+   * URL shape, bearer, Last-Event-ID cursor — is recorded where reads can
+   * pick it up. Installed once per page, effective from the next navigation.
+   */
+  async #installOutWireHook(page) {
+    if (this.#outWireHookPages.has(page)) return;
+    this.#outWireHookPages.add(page);
+    await page.addInitScript(() => {
+      window.__arenaBridgeOutWire = { url: "", auth: "", lastEventId: "" };
+      const original = window.fetch;
+      window.fetch = function (input, init) {
+        try {
+          const url = typeof input === "string" ? input : (input && input.url) || "";
+          if (url.includes("/sessions/") && url.includes("/out")) {
+            const headers = (init && init.headers) || (input && input.headers) || {};
+            const get = (key) => {
+              try {
+                if (typeof headers.get === "function") return headers.get(key) || "";
+                return headers[key] || headers[key.toLowerCase()] || "";
+              } catch {
+                return "";
+              }
+            };
+            window.__arenaBridgeOutWire = {
+              url: String(url),
+              auth: String(get("authorization")),
+              lastEventId: String(get("last-event-id")),
+            };
+          }
+        } catch {
+          /* recorder must never break the app's fetch */
+        }
+        return original.apply(this, arguments);
+      };
+    });
   }
 
   /**
@@ -793,6 +838,17 @@ export class Bridge {
     let observedToken = "";
     let observedOutUrl = "";
     let observedLastEventId = "";
+    // Preferred source: the fetch hook installed at page level (see
+    // #installOutWireHook) sees the app's /out connection even when it opened
+    // during page load, before any listener of ours existed.
+    const wire = await page
+      .evaluate(() => window.__arenaBridgeOutWire || null)
+      .catch(() => null);
+    if (wire?.url && wire.url.includes(state.id)) {
+      if (!observedOutUrl) observedOutUrl = wire.url;
+      if (!observedLastEventId && wire.lastEventId) observedLastEventId = wire.lastEventId;
+      if (!observedToken && wire.auth) observedToken = wire.auth;
+    }
     const tokenListener = (request) => {
       if (sessionUrlMatches(request.url()) && request.url().includes("/out")) {
         // Remember the /out URL shape the app itself uses — readLatestTurn must
