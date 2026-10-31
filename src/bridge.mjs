@@ -841,8 +841,12 @@ export class Bridge {
         { status: response.status() }
       );
     }
+    // Token preference: the Bearer captured from the app's OWN /out request is
+    // what /out actually accepts — since the agent-runner id form landed, the
+    // append response's public-access-token opens /out but the stream closes
+    // instantly (200 with an empty body). Use it only as a fallback.
     const headerToken = response.headers()["public-access-token"] || "";
-    if (headerToken) observedToken = headerToken;
+    if (!observedToken && headerToken) observedToken = headerToken;
     if (observedToken) state.token = observedToken;
     if (observedOutUrl) state.outUrl = observedOutUrl;
   }
