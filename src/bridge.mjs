@@ -898,6 +898,48 @@ export class Bridge {
       if (wire.auth) state.token = wire.auth;
       if (!state.lastEventId && wire.lastEventId) state.lastEventId = wire.lastEventId;
     }
+    // Tap-first: the app's own /out response is already tapped into
+    // window.__arenaBridgeOutData by the page-level hook — and the app's
+    // bearer/cursor are injected BELOW page-JS visibility (no service worker,
+    // no fetch-call header), so a parallel authenticated fetch gets 401/403.
+    // Drain the tap instead; the direct fetch stays as fallback.
+    if (wire?.url) {
+      const tapped = await page.evaluate(
+        async ({ readBudgetMs }) => {
+          const t0 = Date.now();
+          const deadline = readBudgetMs && Number(readBudgetMs) > 0 ? t0 + Number(readBudgetMs) + 30_000 : t0 + 600_000;
+          let lastSeq = 0;
+          let carry = "";
+          let raw = "";
+          let hasFinish = false;
+          let turnCompleteSeen = false;
+          while (Date.now() < deadline) {
+            const arr = window.__arenaBridgeOutData;
+            let newest = lastSeq;
+            for (const chunk of arr) {
+              if (chunk.id <= lastSeq) continue;
+              newest = Math.max(newest, chunk.id);
+              carry += chunk.text;
+              let cut;
+              while ((cut = carry.indexOf("\n\n")) >= 0) {
+                const block = carry.slice(0, cut);
+                carry = carry.slice(cut + 2);
+                raw += block + "\n\n";
+                if (block.includes('"type":"finish"')) hasFinish = true;
+                if (block.includes("turn-complete")) turnCompleteSeen = true;
+              }
+            }
+            lastSeq = newest;
+            if (hasFinish && turnCompleteSeen) break;
+            await new Promise((r) => setTimeout(r, 400));
+          }
+          return { raw, hasFinish, breakReason: hasFinish ? "tap:turn-complete" : "tap:budget" };
+        },
+        { readBudgetMs }
+      );
+      if (tapped.raw) return tapped.raw;
+      // fall through to the direct fetch when the tap produced nothing
+    }
     const result = await page.evaluate(
       async ({ id, token, outUrl, lastEventId, readBudgetMs }) => {
         const controller = new AbortController();
@@ -942,8 +984,17 @@ export class Bridge {
       },
       { id: state.id, token: state.token, outUrl: state.outUrl || "", lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "" }
     );
-    if (result.status !== 200)
-      throw Object.assign(new Error(`Arena Agent output failed: ${result.status}`), { status: result.status });
+    if (result.status !== 200) {
+      const wireNow = await page.evaluate(() => ({
+        wire: window.__arenaBridgeOutWire || null,
+        tapChunks: window.__arenaBridgeOutData ? window.__arenaBridgeOutData.length : -1,
+        tapTail: window.__arenaBridgeOutData && window.__arenaBridgeOutData.length ? window.__arenaBridgeOutData[window.__arenaBridgeOutData.length - 1].text.slice(0, 120) : "",
+      })).catch(() => ({ error: "wire probe failed" }));
+      throw Object.assign(
+        new Error(`Arena Agent output failed: ${result.status} | diag=${JSON.stringify(wireNow).slice(0, 400)}`),
+        { status: result.status }
+      );
+    }
     return result.raw;
   }
 
