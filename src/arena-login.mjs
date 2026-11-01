@@ -227,7 +227,18 @@ export class ArenaBrowser {
     }
     return retry(
       async () => {
-        const args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"];
+        // Background-tab throttling/occlusion kills long renderer operations
+        // (observed: "Target crashed" ~400s into long turns on a headed window
+        // that lost focus) — automation tabs must never be frozen or discarded.
+        const args = [
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-blink-features=AutomationControlled",
+          "--disable-renderer-backgrounding",
+          "--disable-backgrounding-occluded-windows",
+          "--disable-background-timer-throttling",
+          "--disable-features=CalculateNativeWinOcclusion,TabFreezes,MemorySaver",
+        ];
         if (this.proxy) args.push(`--proxy-server=${this.proxy}`);
         const launchOpts = { headless: process.env.ARENA_HEADED !== "1", args };
         if (this.chromePath) launchOpts.executablePath = this.chromePath;
@@ -364,7 +375,9 @@ export class ArenaBrowser {
 
     const held = entry.pages.get(purpose);
     if (pageAction({ hasPage: Boolean(held), closed: Boolean(held?.isClosed?.()) }) === "create") {
-      entry.pages.set(purpose, await entry.context.newPage());
+      const createdPage = await entry.context.newPage();
+      createdPage.on("crash", () => log.warn("browser", "page crashed", { purpose }));
+      entry.pages.set(purpose, createdPage);
     }
     const page = entry.pages.get(purpose);
     await this.#installOutWireHook(page);
