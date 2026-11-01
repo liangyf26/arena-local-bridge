@@ -799,9 +799,16 @@ export class Bridge {
     // Preferred source: the fetch hook installed at page level (see
     // #installOutWireHook) sees the app's /out connection even when it opened
     // during page load, before any listener of ours existed.
-    const wire = await page
-      .evaluate(() => window.__arenaBridgeOutWire || null)
-      .catch(() => null);
+    // The app connects /out asynchronously after an SPA route change — poll
+    // briefly for the wire to appear instead of reading with a stale token.
+    let wire = null;
+    for (let waited = 0; waited <= 10_000; waited += 1_000) {
+      wire = await page
+        .evaluate(() => window.__arenaBridgeOutWire || null)
+        .catch(() => null);
+      if (wire?.url && wire.url.includes(state.id)) break;
+      await new Promise((r) => setTimeout(r, 1_000));
+    }
     if (wire?.url && wire.url.includes(state.id)) {
       if (!observedOutUrl) observedOutUrl = wire.url;
       if (!observedLastEventId && wire.lastEventId) observedLastEventId = wire.lastEventId;
