@@ -376,7 +376,9 @@ export class ArenaBrowser {
     const held = entry.pages.get(purpose);
     if (pageAction({ hasPage: Boolean(held), closed: Boolean(held?.isClosed?.()) }) === "create") {
       const createdPage = await entry.context.newPage();
-      createdPage.on("crash", () => log.warn("browser", "page crashed", { purpose }));
+      try {
+        if (typeof createdPage.on === "function") createdPage.on("crash", () => log.warn("browser", "page crashed", { purpose }));
+      } catch {}
       entry.pages.set(purpose, createdPage);
     }
     const page = entry.pages.get(purpose);
