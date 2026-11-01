@@ -1038,6 +1038,10 @@ export class Bridge {
           let lastSeq = 0; // consume the tap from its start; marker windows pick our turn
           let carry = "";
           const turns = new Map();
+          // The reply is the TEXT stream only. Reasoning deltas are kept in
+          // `turns` for node/debug parity with the fetch path, but must never
+          // leak into the answer (the fetch path's ourText is text-delta only).
+          const textTurns = new Map();
           const nativeById = new Map();
           const native = [];
           const events = []; // { type, node, pos } for our-turn windowing
@@ -1066,6 +1070,10 @@ export class Bridge {
             }
             if ((data.type === "text-delta" || data.type === "reasoning-delta") && typeof data.delta === "string") {
               turns.set(key, (turns.get(key) || "") + data.delta);
+              if (data.type === "text-delta") {
+                textTurns.set(key, (textTurns.get(key) || "") + data.delta);
+                lastDeltaNode = key;
+              }
               curNode = node;
               if (!msToFirstText) msToFirstText = Date.now() - t0;
               events.push({ type: data.type, key, pos: events.length });
@@ -1138,7 +1146,7 @@ export class Bridge {
                         handleEvent(data);
                         // Marker detection: our turn's text carries the per-request nonce.
                         if (!sawMarker && marker) {
-                          const now = turns.get(String(curNode)) || "";
+                          const now = textTurns.get(String(curNode)) || "";
                           if (now.includes(marker) && !before.includes(marker)) sawMarker = true;
                         }
                       }
@@ -1156,11 +1164,12 @@ export class Bridge {
           }
 
           // Our turn = events after the last finish that preceded the marker
-          // text. The marker-bearing node's text (minus the marker) is the reply;
+          // text. The marker-bearing node's TEXT-ONLY stream (minus the marker)
+          // is the reply — reasoning deltas stay in `turns` and never leak in;
           // native tool events inside that window belong to our turn.
           let markerNode = null;
           if (marker) {
-            for (const [k, v] of turns) if (v.includes(marker)) markerNode = k;
+            for (const [k, v] of textTurns) if (v.includes(marker)) markerNode = k;
           }
           let windowStart = 0;
           if (markerNode && events.length) {
@@ -1176,12 +1185,12 @@ export class Bridge {
           const ourEvents = events.slice(windowStart);
           const ourTurnFinishes = ourEvents.filter((e) => e.type === "finish").length;
           const ourToolEvents = ourEvents.filter((e) => e.type.startsWith("tool-input")).length;
-          const ourTextNodes = new Set(ourEvents.filter((e) => e.key && (e.type === "text-delta" || e.type === "reasoning-delta")).map((e) => e.key));
+          const ourTextNodes = new Set(ourEvents.filter((e) => e.key && e.type === "text-delta").map((e) => e.key));
           let ourText = "";
           if (markerNode) {
-            ourText = (turns.get(markerNode) || "").split(marker)[0] || (turns.get(markerNode) || "");
+            ourText = (textTurns.get(markerNode) || "").split(marker)[0] || (textTurns.get(markerNode) || "");
           } else if (ourTextNodes.size) {
-            ourText = turns.get([...ourTextNodes].pop()) || "";
+            ourText = textTurns.get([...ourTextNodes].pop()) || "";
           }
           // Tool events are keyed by their own node ids — include any native
           // call whose events sit inside our window (native[] is already
