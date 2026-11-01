@@ -475,124 +475,10 @@ export class Bridge {
    * default pick, which is what the session-creating flows want.
    */
   async #page(account, purpose) {
-    const page = await this.browser.getPage(account || this.#credential(), purpose);
-    // Arm the /out wire recorder BEFORE the app loads: the app's realtime
-    // connection (carrying the /out cursor + bearer the reads need) opens at
-    // page load, and a listener attached later can never see it.
-    await this.#installOutWireHook(page).catch(() => undefined);
-    return page;
-  }
-
-  #outWireHookPages = new WeakSet();
-
-  /**
-   * Wrap window.fetch on the session page so the app's own /out request —
-   * URL shape, bearer, Last-Event-ID cursor — is recorded where reads can
-   * pick it up. Installed once per page, effective from the next navigation.
-   */
-  async #installOutWireHook(page) {
-    if (this.#outWireHookPages.has(page)) return;
-    this.#outWireHookPages.add(page);
-    await page.addInitScript(() => {
-      window.__arenaBridgeOutWire = { url: "", auth: "", lastEventId: "" };
-      const record = (url, getHeader) => {
-        try {
-          if (String(url).includes("/sessions/") && String(url).includes("/out")) {
-            window.__arenaBridgeOutWire = {
-              url: String(url),
-              auth: String(getHeader("authorization") || getHeader("Authorization") || ""),
-              lastEventId: String(getHeader("last-event-id") || getHeader("Last-Event-ID") || ""),
-            };
-          }
-        } catch {
-          /* recorder must never break the app's request */
-        }
-      };
-      const original = window.fetch;
-      window.fetch = function (input, init) {
-        try {
-          const url = typeof input === "string" ? input : (input && input.url) || "";
-          const headers = (init && init.headers) || (input && input.headers) || {};
-          const get = (key) => {
-            try {
-              if (typeof headers.get === "function") return headers.get(key) || "";
-              return headers[key] || headers[key.toLowerCase()] || "";
-            } catch {
-              return "";
-            }
-          };
-          record(url, get);
-          // Tap the app's own /out response: tee its body through a
-          // TransformStream so the app keeps streaming normally while a copy
-          // lands in the bridge's buffer. The app's connection is the ONLY one
-          // the 2026-10-31 deployments serve — parallel fetches get the HTML
-          // shell or an instant close, so riding its stream is the only read.
-          if (url.includes("/sessions/") && url.includes("/out")) {
-            const result = original.apply(this, arguments);
-            try {
-              return Promise.resolve(result).then((res) => {
-                try {
-                  if (!res || !res.body || !res.ok) return res;
-                  const tap = new TransformStream();
-                  const writer = tap.writable.getWriter();
-                  const conn = (window.__arenaBridgeOutConn = (window.__arenaBridgeOutConn || 0) + 1);
-                  if (!window.__arenaBridgeOutData) window.__arenaBridgeOutData = [];
-                  (async () => {
-                    const reader = res.body.getReader();
-                    const decoder = new TextDecoder();
-                    while (true) {
-                      const { done, value } = await reader.read();
-                      if (done) {
-                        await writer.close().catch(() => {});
-                        break;
-                      }
-                      await writer.write(value).catch(() => {});
-                      window.__arenaBridgeOutSeq = (window.__arenaBridgeOutSeq || 0) + 1;
-                      window.__arenaBridgeOutData.push({ id: window.__arenaBridgeOutSeq, conn, text: decoder.decode(value, { stream: true }) });
-                      if (window.__arenaBridgeOutData.length > 300) window.__arenaBridgeOutData.splice(0, window.__arenaBridgeOutData.length - 300);
-                    }
-                  })().catch(() => {});
-                  const headers = new Headers(res.headers);
-                  headers.delete("content-encoding");
-                  headers.delete("content-length");
-                  return new Response(tap.readable, { status: res.status, statusText: res.statusText, headers });
-                } catch {
-                  return res;
-                }
-              });
-            } catch {
-              return result;
-            }
-          }
-        } catch {
-          /* recorder must never break the app's fetch */
-        }
-        return original.apply(this, arguments);
-      };
-      // The app may use XHR for the realtime stream — Playwright's request
-      // events see both, so the recorder must too.
-      const OriginalXHR = window.XMLHttpRequest;
-      const originalOpen = OriginalXHR.prototype.open;
-      const originalSetHeader = OriginalXMLHttpRequest.prototype.setRequestHeader;
-      OriginalXMLHttpRequest.prototype.open = function (method, url) {
-        this.__arenaBridgeUrl = url;
-        this.__arenaBridgeHeaders = {};
-        return originalOpen.apply(this, arguments);
-      };
-      OriginalXMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-        try {
-          if (this.__arenaBridgeHeaders) this.__arenaBridgeHeaders[String(name).toLowerCase()] = value;
-        } catch {}
-        return originalSetHeader.apply(this, arguments);
-      };
-      const originalSend = OriginalXHR.prototype.send;
-      OriginalXMLHttpRequest.prototype.send = function () {
-        try {
-          if (this.__arenaBridgeUrl) record(this.__arenaBridgeUrl, (k) => this.__arenaBridgeHeaders[String(k).toLowerCase()] || "");
-        } catch {}
-        return originalSend.apply(this, arguments);
-      };
-    });
+    // The /out wire recorder (tap + cursor/bearer capture) is armed inside
+    // ArenaBrowser.getPage — the single place every page enters, so CLI
+    // scripts that bypass Bridge.#page get it too.
+    return this.browser.getPage(account || this.#credential(), purpose);
   }
 
   /**
@@ -992,6 +878,19 @@ export class Bridge {
   }
 
   async readAgentOutput(page, state) {
+    // Wire merge (same as appendAgentMessage): the createAgentSession path
+    // never goes through append, so without this the read uses the page-HTML
+    // public token — which /out rejects with 403 since the agent-runner id
+    // form landed. The app's own /out bearer (scoped to agent-runner:<id>) is
+    // what the endpoint accepts.
+    const wire = await page
+      .evaluate(() => window.__arenaBridgeOutWire || null)
+      .catch(() => null);
+    if (wire?.url && wire.url.includes(state.id)) {
+      if (!state.outUrl) state.outUrl = wire.url;
+      if (wire.auth) state.token = wire.auth;
+      if (!state.lastEventId && wire.lastEventId) state.lastEventId = wire.lastEventId;
+    }
     const result = await page.evaluate(
       async ({ id, token, outUrl, lastEventId, readBudgetMs }) => {
         const controller = new AbortController();

@@ -208,6 +208,9 @@ export class ArenaBrowser {
     // again — the probe itself no-ops on a same-version repeat, but the parse
     // is not free.
     this.probedPages = new WeakSet();
+    // Pages already carrying the /out wire hook (fetch+XHR recorder + response
+    // tap — see #installOutWireHook). Idempotent per page for the same reason.
+    this.outWireHookPages = new WeakSet();
     // False once we know assets/arena-model-probe.inject.js is missing.
     this.probeAvailable = true;
     // Set by close(): a scheduled idle rebuild must not outlive shutdown.
@@ -364,6 +367,7 @@ export class ArenaBrowser {
       entry.pages.set(purpose, await entry.context.newPage());
     }
     const page = entry.pages.get(purpose);
+    await this.#installOutWireHook(page);
     // Every page that carries a conversation gets the probe: a run on it leaves
     // a trace behind, and the trace's cost spans are where the USD quota reading
     // comes from — so it has to be registered BEFORE the navigation that carries
@@ -471,6 +475,123 @@ export class ArenaBrowser {
       });
     }
     return { launched: Boolean(this.browser), accounts };
+  }
+
+  /**
+   * Arm the /out wire recorder on a session page: wraps window.fetch and
+   * XMLHttpRequest (before the app loads — addInitScript runs on the next
+   * navigation) so the app's own realtime /out request is recorded into
+   * window.__arenaBridgeOutWire, and its response body is TAPPED through a
+   * TransformStream into window.__arenaBridgeOutData.
+   *
+   * Why this exists: the 2026-10-31 deployments put /out behind a
+   * service-worker-injected bearer + cursor and stopped serving the stream to
+   * page-level parallel fetches — the app's own connection is the only one
+   * served, so the bridge reads by riding it. The bridge's reads
+   * (appendAgentMessage / readAgentOutput / readLatestTurn) consume these
+   * window records; this is the single arm point covering every entry path
+   * (service #page, CLI scripts calling browser.getPage directly).
+   */
+  async #installOutWireHook(page) {
+    if (this.outWireHookPages.has(page)) return;
+    this.outWireHookPages.add(page);
+    await page.addInitScript(() => {
+      window.__arenaBridgeOutWire = { url: "", auth: "", lastEventId: "" };
+      const record = (url, getHeader) => {
+        try {
+          if (String(url).includes("/sessions/") && String(url).includes("/out")) {
+            window.__arenaBridgeOutWire = {
+              url: String(url),
+              auth: String(getHeader("authorization") || getHeader("Authorization") || ""),
+              lastEventId: String(getHeader("last-event-id") || getHeader("Last-Event-ID") || ""),
+            };
+          }
+        } catch {
+          /* recorder must never break the app's request */
+        }
+      };
+      const originalFetch = window.fetch;
+      window.fetch = function (input, init) {
+        try {
+          const url = typeof input === "string" ? input : (input && input.url) || "";
+          const headers = (init && init.headers) || (input && input.headers) || {};
+          const get = (key) => {
+            try {
+              if (typeof headers.get === "function") return headers.get(key) || "";
+              return headers[key] || headers[key.toLowerCase()] || "";
+            } catch {
+              return "";
+            }
+          };
+          record(url, get);
+          // Tap the app's own /out response: tee its body through a
+          // TransformStream so the app keeps streaming normally while a copy
+          // lands in the bridge's buffer.
+          if (url.includes("/sessions/") && url.includes("/out")) {
+            const result = originalFetch.apply(this, arguments);
+            try {
+              return Promise.resolve(result).then((res) => {
+                try {
+                  if (!res || !res.body || !res.ok) return res;
+                  const tap = new TransformStream();
+                  const writer = tap.writable.getWriter();
+                  const conn = (window.__arenaBridgeOutConn = (window.__arenaBridgeOutConn || 0) + 1);
+                  if (!window.__arenaBridgeOutData) window.__arenaBridgeOutData = [];
+                  (async () => {
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+                    while (true) {
+                      const { done, value } = await reader.read();
+                      if (done) {
+                        await writer.close().catch(() => {});
+                        break;
+                      }
+                      await writer.write(value).catch(() => {});
+                      window.__arenaBridgeOutSeq = (window.__arenaBridgeOutSeq || 0) + 1;
+                      window.__arenaBridgeOutData.push({ id: window.__arenaBridgeOutSeq, conn, text: decoder.decode(value, { stream: true }) });
+                      if (window.__arenaBridgeOutData.length > 300) window.__arenaBridgeOutData.splice(0, window.__arenaBridgeOutData.length - 300);
+                    }
+                  })().catch(() => {});
+                  const headers = new Headers(res.headers);
+                  headers.delete("content-encoding");
+                  headers.delete("content-length");
+                  return new Response(tap.readable, { status: res.status, statusText: res.statusText, headers });
+                } catch {
+                  return res;
+                }
+              });
+            } catch {
+              return result;
+            }
+          }
+        } catch {
+          /* recorder must never break the app's fetch */
+        }
+        return originalFetch.apply(this, arguments);
+      };
+      // The app may use XHR for the realtime stream — record that too.
+      const OriginalXHR = window.XMLHttpRequest;
+      const originalOpen = OriginalXHR.prototype.open;
+      const originalSetHeader = OriginalXHR.prototype.setRequestHeader;
+      OriginalXHR.prototype.open = function (method, url) {
+        this.__arenaBridgeUrl = url;
+        this.__arenaBridgeHeaders = {};
+        return originalOpen.apply(this, arguments);
+      };
+      OriginalXHR.prototype.setRequestHeader = function (name, value) {
+        try {
+          if (this.__arenaBridgeHeaders) this.__arenaBridgeHeaders[String(name).toLowerCase()] = value;
+        } catch {}
+        return originalSetHeader.apply(this, arguments);
+      };
+      const originalSend = OriginalXHR.prototype.send;
+      OriginalXHR.prototype.send = function () {
+        try {
+          if (this.__arenaBridgeUrl) record(this.__arenaBridgeUrl, (k) => this.__arenaBridgeHeaders[String(k).toLowerCase()] || "");
+        } catch {}
+        return originalSend.apply(this, arguments);
+      };
+    });
   }
 
   /** Shutdown, or recovery after the browser died: close every Account's context. */
