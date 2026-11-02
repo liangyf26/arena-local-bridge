@@ -463,7 +463,11 @@ export class ArenaBrowser {
     // After the Account's own cookies: the pin has to be the __vdpl this
     // context sends, and the create-chat route has to exist before the page
     // that will POST it is created.
-    await installDeploymentPin(entry.context, deploymentPin());
+    await installDeploymentPin(entry.context);
+    // Arm the /out wire hook on the NEW context here — getPage would also do
+    // it on the next call, but arming at creation removes any window where a
+    // page could navigate before the recorder exists.
+    await this.#installOutWireHook(entry.context);
     entry.signature = signature;
     entry.staleSince = 0;
     entry.warned = false;
