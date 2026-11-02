@@ -210,7 +210,7 @@ export class ArenaBrowser {
     this.probedPages = new WeakSet();
     // Pages already carrying the /out wire hook (fetch+XHR recorder + response
     // tap — see #installOutWireHook). Idempotent per page for the same reason.
-    this.outWireHookPages = new WeakSet();
+    this.outWireHookPages = new Set(); // contexts, not pages — replaced on rebuild
     // False once we know assets/arena-model-probe.inject.js is missing.
     this.probeAvailable = true;
     // Set by close(): a scheduled idle rebuild must not outlive shutdown.
@@ -381,14 +381,19 @@ export class ArenaBrowser {
       } catch {}
       entry.pages.set(purpose, createdPage);
     }
-    const page = entry.pages.get(purpose);
-    await this.#installOutWireHook(page);
+    // The /out wire hook lives on the CONTEXT (not the page): a page-level
+    // addInitScript was observed never to arm on this app's navigations, while
+    // the context-level script (the webdriver spoof below) demonstrably does.
+    // Context init scripts apply to every page in the context, including ones
+    // that already exist.
+    await this.#installOutWireHook(entry.context);
     // Every page that carries a conversation gets the probe: a run on it leaves
     // a trace behind, and the trace's cost spans are where the USD quota reading
     // comes from — so it has to be registered BEFORE the navigation that carries
     // the turn, which is why it happens here rather than at any call site.
     // Whether a purpose carries one is part of PAGE_PURPOSES, so a new purpose
     // has to say so rather than inheriting an answer.
+    const page = entry.pages.get(purpose);
     if (PAGE_PURPOSES[purpose].probe && !this.probedPages.has(page)) {
       this.probedPages.add(page);
       const installed = await installProbe(page);
@@ -507,10 +512,10 @@ export class ArenaBrowser {
    * window records; this is the single arm point covering every entry path
    * (service #page, CLI scripts calling browser.getPage directly).
    */
-  async #installOutWireHook(page) {
-    if (this.outWireHookPages.has(page)) return;
-    this.outWireHookPages.add(page);
-    await page.addInitScript(() => {
+  async #installOutWireHook(context) {
+    if (this.outWireHookPages.has(context)) return;
+    this.outWireHookPages.add(context);
+    await context.addInitScript(() => {
       window.__arenaBridgeOutWire = { url: "", auth: "", lastEventId: "" };
       const record = (url, getHeader) => {
         try {
@@ -539,6 +544,23 @@ export class ArenaBrowser {
             }
           };
           record(url, get);
+          // Ack recorder for /in/append: appendAgentMessage races its
+          // Playwright waitForResponse against these stamps, because the
+          // app's append response may not surface as a Playwright-visible
+          // event even though the message was delivered.
+          if (url.includes("/in/append")) {
+            const appendResult = originalFetch.apply(this, arguments);
+            Promise.resolve(appendResult)
+              .then(() => {
+                try {
+                  window.__arenaBridgeAppends = window.__arenaBridgeAppends || [];
+                  window.__arenaBridgeAppends.push(Date.now());
+                  if (window.__arenaBridgeAppends.length > 20) window.__arenaBridgeAppends.shift();
+                } catch {}
+              })
+              .catch(() => {});
+            return appendResult;
+          }
           // Tap the app's own /out response: tee its body through a
           // TransformStream so the app keeps streaming normally while a copy
           // lands in the bridge's buffer.

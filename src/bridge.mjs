@@ -854,7 +854,59 @@ export class Bridge {
       })
       .catch(() => ({ found: false, enabled: false }));
     if (!clickedSend.found || !clickedSend.enabled) await editor.press("Enter").catch(() => undefined);
-    const response = await appendResponse;
+    // Arm the ack window: the page hook stamps completed appends; anything
+    // completing AFTER this moment is our ack.
+    await page
+      .evaluate(() => {
+        window.__arenaBridgeAppendAckAt = Date.now();
+      })
+      .catch(() => undefined);
+    // The append POST itself now rides the page's fetch hook: since the
+    // agent-runner form landed, the app's append request may not surface as a
+    // Playwright-visible response (the same SW-layer obfuscation as /out), so
+    // waitForResponse can time out on a DELIVERED message. Record app-side
+    // append completions in the wire hook and prefer that ack; Playwright's
+    // response stays as a fast path when it does surface.
+    const response = await Promise.race([
+      appendResponse.catch(() => null),
+      page
+        .waitForFunction(
+          () => {
+            const ackAt = window.__arenaBridgeAppendAckAt || 0;
+            return Boolean(window.__arenaBridgeAppends && window.__arenaBridgeAppends.some((a) => a > ackAt));
+          },
+          undefined,
+          { timeout: this.config.composerWaitMs }
+        )
+        .then(() => ({ __tappedAppend: true }))
+        .catch(() => null),
+    ]);
+    if (response && response.__tappedAppend) {
+      // Delivered, confirmed by the app's own fetch completing. No response
+      // object to read headers from — the /out wire (captured above) carries
+      // the credentials the read needs.
+      page.off("request", tokenListener);
+      if (observedToken) state.token = observedToken;
+      if (observedOutUrl) state.outUrl = observedOutUrl;
+      if (observedLastEventId && !state.lastEventId) state.lastEventId = observedLastEventId;
+      log.info("bridge", "append delivered (tapped ack)", { sessionId: state.id });
+      return;
+    }
+    if (!response) {
+      // Neither path saw an ack. Diagnostic: was the message actually sent?
+      // Did the wire see the /out reconnect? (append-timeout turned out to
+      // outlive a DELIVERED message.)
+      const state2 = await page
+        .evaluate(() => ({
+          bodyTail: (document.body.innerText || "").slice(-600),
+          wire: window.__arenaBridgeOutWire || null,
+          tapChunks: window.__arenaBridgeOutData ? window.__arenaBridgeOutData.length : -1,
+          appends: window.__arenaBridgeAppends || null,
+        }))
+        .catch((e) => ({ evalError: String(e).slice(0, 80) }));
+      page.off("request", tokenListener);
+      throw Object.assign(new Error(`append ack timeout | diag=${JSON.stringify(state2).slice(0, 500)}`), { status: 504 });
+    }
     const outputRequest = await freshOutputRequest;
     if (outputRequest) {
       const auth = outputRequest.headers().authorization || "";
