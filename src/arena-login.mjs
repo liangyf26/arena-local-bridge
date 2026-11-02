@@ -441,6 +441,21 @@ export class ArenaBrowser {
         delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
         delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
       } catch {}
+      // Unmasked WebGL vendor/renderer: a VPS without a GPU reports
+      // "SwiftShader" — one of the strongest automation tells there is. Report
+      // the laptop's real iGPU strings instead (recaptcha reads these first).
+      try {
+        const spoofGL = (proto) => {
+          const original = proto.getParameter;
+          proto.getParameter = function (p) {
+            if (p === 37445) return "Google Inc. (Intel)";
+            if (p === 37446) return "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x000046A6) Direct3D11 vs_5_0 ps_5_0, D3D11)";
+            return original.call(this, p);
+          };
+        };
+        spoofGL(WebGLRenderingContext.prototype);
+        spoofGL(WebGL2RenderingContext.prototype);
+      } catch {}
       // Spoof the rest of the navigator fingerprint so it reads like a normal
       // desktop Edge/Chrome (mirrors the Arena模型助手 FingerprintEnvironment.js,
       // which fakes these same props — reCAPTCHA cross-checks them).
