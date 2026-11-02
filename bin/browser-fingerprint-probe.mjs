@@ -33,9 +33,16 @@ if (cdpUrl) {
   // synthetic profile with the same leaks we are trying to escape.
   context = browser.contexts()[0] || (await browser.newContext());
 } else {
+  // Measure the REAL service-shaped context: getPage is where the context
+  // init scripts (webdriver/nav/webgl spoofs) actually live. A raw
+  // browser.newContext() bypasses all of it and measures nothing useful.
+  const { CredentialStore } = await import("../src/credentials.mjs");
+  const { requireSecret } = await import("../src/secret.mjs");
+  const secret = requireSecret(dotEnv);
+  const credentials = new CredentialStore({ filePath: config.credentialsFile, secret, omniDbPath: config.omniDbPath, omniRoot: config.omniRoot }).load();
   const arena = new ArenaBrowser({ omniRoot: config.omniRoot, chromePath: config.chromePath, proxy: config.proxy });
-  browser = await arena.launch();
-  context = await browser.newContext();
+  browser = { close: () => arena.close().catch(() => undefined) };
+  context = { newPage: () => arena.getPage(credentials.primary(), "harvest") };
 }
 
 const page = await context.newPage();
