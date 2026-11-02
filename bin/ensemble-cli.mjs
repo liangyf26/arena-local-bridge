@@ -155,22 +155,80 @@ if (command === "vote") {
   process.exit(0);
 }
 
-if (command === "votes") {
+if (command === "slot") {
   const sessionId = args[0];
-  const records = readVotes(dataDir, sessionId ? { sessionId } : {});
-  if (!records.length) {
-    console.log(`no stored votes at ${path.join(dataDir, "identification-votes.jsonl")}`);
-    process.exit(0);
+  if (!sessionId) {
+    console.error("usage: ensemble-cli.mjs slot <sessionId> [--data dir] [--code] [--min-agree N]");
+    process.exit(2);
   }
-  for (const r of records) {
-    const top = r.votes.reduce((a, b) => ((b.posterior || 0) > (a?.posterior || 0) ? b : a), null);
-    console.log(`${r.at}  ${String(r.sessionId).slice(0, 13).padEnd(13)}  ${r.signal.padEnd(10)}  ${r.votes.length} pair(s), top: ${top?.model ?? "?"}`);
+  const baseline = loadBaselineOrThrow(dataDir);
+  const signals = [];
+  const telemetry = telemetryVoteFromTasks(dataDir, sessionId, baseline, { last: numberFlag("last", 20) });
+  if (telemetry) signals.push(telemetry);
+  for (const stored of readVotes(dataDir, { sessionId })) {
+    signals.push({
+      signal: stored.signal,
+      ...(stored.weight !== undefined ? { weight: stored.weight } : {}),
+      votes: stored.votes,
+      notes: stored.notes,
+    });
+  }
+  if (!signals.length) {
+    console.error(
+      `no evidence for ${sessionId} yet — use the slot for real tasks (telemetry accumulates passively)\n` +
+      `or run a numeric probe (ensemble-cli.mjs vote <id> numeric <file>)`
+    );
+    process.exit(1);
+  }
+  const result = fuseVotes(signals, canonicalClasses(baseline), {
+    minAgree: numberFlag("min-agree", DEFAULT_MIN_AGREE),
+    threshold: numberFlag("threshold", CONFIDENCE_THRESHOLD),
+    minLogMargin: numberFlag("min-log-margin", MIN_LOG_MARGIN),
+    weights: weightFlags(),
+    aliases: loadAliases(),
+    topN: numberFlag("top-n", 5),
+  });
+
+  const isCode = hasFlag("code");
+  const codeRank = (name) => {
+    const m = (baseline.models || []).find((x) => x.name === name);
+    return m?.rank ?? null;
+  };
+  const codeTop10 = (baseline.models || [])
+    .slice(0, 10)
+    .map((m) => `#${m.rank} ${m.name}`);
+
+  if (hasFlag("json")) {
+    console.log(JSON.stringify({ ...result, codeRank: result.model ? codeRank(result.model) : null }, null, 2));
+  } else {
+    for (const s of signals) {
+      console.error(`# signal ${s.signal}: ${s.votes.length} vote(s)${s.notes?.length ? ` (${s.notes.join("; ")})` : ""}`);
+    }
+    for (const note of result.notes) console.error(`# ${note}`);
+    console.log("");
+    for (const r of result.ranked) {
+      const rank = codeRank(r.model);
+      console.log(`${(r.posterior * 100).toFixed(2).padStart(6)}%  ${r.model.padEnd(52)} ${isCode && rank ? `Code#${rank}  ` : ""}logLik=${r.logLik.toFixed(2)}  seenBy=${r.seenBy}`);
+    }
+    console.log("");
+    if (result.model) {
+      const rank = codeRank(result.model);
+      console.log(`identity : ${result.model}${rank ? `  [Code rank #${rank} of ${(baseline.models || []).length}]` : "  [not on the current Code snapshot]"}`);
+      console.log(`verdict  : ${result.status} (${result.agreement.agreeing.join(", ") || "no agreement"} — gate ${result.agreement.required})`);
+    } else {
+      console.log(`verdict  : ${result.status} — ${result.reason}`);
+    }
+    if (isCode) {
+      console.log(`\ncode top-10 for reference:`);
+      for (const line of codeTop10) console.log(`  ${line}`);
+    }
   }
   process.exit(0);
 }
 
 console.error(`usage:
   ensemble-cli.mjs fuse <sessionId>            fuse all signals for a session into a verdict
+  ensemble-cli.mjs slot <sessionId> [--code]   slot checkup: identity + Code-rank guidance
   ensemble-cli.mjs vote <id> <signal> <file>   record a stored signal vote (file or - for stdin)
   ensemble-cli.mjs votes [sessionId]           list stored votes
   options: --data <dir> (default ~/.arena-bridge)`);

@@ -170,8 +170,12 @@ function buildRecord(cells, cols) {
 
 /** Snapshot date ("Oct 23, 2026") and session total from surrounding text. */
 export function parseSnapshotMeta(text) {
-  const date = new RegExp(`(?:${MONTHS})[a-z]*\\.?\\s+\\d{1,2},\\s*\\d{4}`, "i").exec(String(text ?? ""));
-  const sessions = /([\d,]{4,})\s+sessions/i.exec(String(text ?? ""));
+  const s = String(text ?? "");
+  // "Oct 23, 2026" (page header) or "2026-11-01" (our snapshot-file headers).
+  const date =
+    new RegExp(`(?:${MONTHS})[a-z]*\\.?\\s+\\d{1,2},\\s*\\d{4}`, "i").exec(s) ||
+    /\b(20\d{2})-(\d{2})-(\d{2})\b/.exec(s);
+  const sessions = /([\d,]{4,})\s+sessions/i.exec(s);
   return {
     snapshotDate: date ? date[0] : null,
     sessionsTotal: sessions ? Number(sessions[1].replace(/,/g, "")) : null,
