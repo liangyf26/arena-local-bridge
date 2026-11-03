@@ -263,6 +263,8 @@ test("runFingerprintReprobe: real converse and getPage can complete a fingerprin
       route: async () => {},
       newPage: async () => ({
         isClosed: () => false,
+        url: () => "",
+        goto: async () => {},
         addInitScript: async () => {},
         evaluate: async () => "",
       }),

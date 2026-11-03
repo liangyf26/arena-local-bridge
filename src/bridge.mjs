@@ -1978,7 +1978,14 @@ export class Bridge {
       let delivered = false;
       const runOnce = async () => {
         const page = await this.#page(account, purpose);
-        if (delivered) await this.#landOnSession(page, sessionId);
+        // Always land on the session first: after a credential rebuild (or any
+        // context swap) the reused page may sit on stale HTML whose embedded
+        // public-access-token Arena has already revoked — appending with it is
+        // a guaranteed 401 "Public Access Token is invalid" (observed). A
+        // fresh navigation re-embeds a live token into the page HTML.
+        if (!delivered || !page.url().includes(sessionId)) {
+          await this.#landOnSession(page, sessionId);
+        }
         // Acquire the session public-access-token up front (re-used below).
         let token = "";
         try {
