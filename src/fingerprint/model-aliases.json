@@ -1,11 +1,16 @@
 {
   "deepseek-v4.1-flash": "DeepSeek-V4.1-Flash-20261017 (Max)",
+  "deepseek-v4-1-flash-261017": "DeepSeek-V4.1-Flash-20261017 (Max)",
+  "deepseek-v4-1-flash-economy-261017": "DeepSeek-V4.1-Flash-20261017 (Max)",
+  "deepseek-v4-pro-ga-260813": "DeepSeek-V4-Pro (High, 20260813)",
   "claude-sonnet-5-5-high": "Claude Sonnet 5.5 (Max)",
   "claude-opus-5-5-high": "Claude Opus 5.5 (Max)",
   "claude-fable-5-1-high": "Claude Fable 5.1 (Max)",
   "claude-fable-5-high": "Claude Fable 5 (High)",
   "kimi-k3.1-pro": "Kimi K3.1 Pro (Max)",
+  "kimi-k3-1-pro-261024": "Kimi K3.1 Pro (Max)",
   "gpt-6-astra": "GPT-6 Astra (Max)",
   "gemini-4-argon": "Gemini 4 Argon (High)",
-  "glm-5.3-flash": "GLM-5.3-Flash"
+  "glm-5.3-flash": "GLM-5.3-Flash",
+  "glm-5.3": "GLM-5.3 (Max)"
 }
