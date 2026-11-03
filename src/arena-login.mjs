@@ -643,6 +643,19 @@ export class ArenaBrowser {
       const originalSend = OriginalXHR.prototype.send;
       OriginalXHR.prototype.send = function () {
         try {
+          const isAppend = String(this.__arenaBridgeUrl || "").includes("/in/append");
+          if (isAppend) {
+            // Append went out over XHR — stamp its completion so the ack
+            // waiter in appendAgentMessage sees it (the fetch branch covers
+            // the fetch case; the app uses whichever transport it likes).
+            this.addEventListener("loadend", () => {
+              try {
+                window.__arenaBridgeAppends = window.__arenaBridgeAppends || [];
+                window.__arenaBridgeAppends.push(Date.now());
+                if (window.__arenaBridgeAppends.length > 20) window.__arenaBridgeAppends.shift();
+              } catch {}
+            });
+          }
           if (this.__arenaBridgeUrl) record(this.__arenaBridgeUrl, (k) => this.__arenaBridgeHeaders[String(k).toLowerCase()] || "");
         } catch {}
         return originalSend.apply(this, arguments);

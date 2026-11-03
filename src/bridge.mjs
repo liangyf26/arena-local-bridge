@@ -876,7 +876,11 @@ export class Bridge {
             return Boolean(window.__arenaBridgeAppends && window.__arenaBridgeAppends.some((a) => a > ackAt));
           },
           undefined,
-          { timeout: this.config.composerWaitMs }
+          // polling: 500 — explicit interval. The default 'raf' polling freezes
+          // when the headed window loses focus (background tabs stop ticking
+          // requestAnimationFrame), which starved this check forever and turned
+          // every delivered append into a full composerWaitMs stall.
+          { polling: 500, timeout: this.config.composerWaitMs }
         )
         .then(() => ({ __tappedAppend: true }))
         .catch(() => null),
