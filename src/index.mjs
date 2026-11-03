@@ -184,6 +184,19 @@ async function main() {
         log.info("refresh", "account verified and refreshed", { account: result.email });
         return result.email;
       } catch (error) {
+        // Proxy outages (v2rayN flap, node switch) fail navigation for EVERY
+        // account equally and are nobody's fault — auto-disabling on them
+        // took the whole pool down over a transient (observed twice). Only
+        // Arena-side rejections (401/403 from arena.ai itself) say the
+        // account is actually unusable.
+        const msg = String(error?.message || "");
+        if (/ERR_PROXY_CONNECTION_FAILED|proxy|ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_(RESET|TIMED_OUT|REFUSED)|timeout/i.test(msg)) {
+          log.warn("refresh", "verification skipped: network/proxy outage (account NOT disabled)", {
+            account: account.email,
+            error: msg.slice(0, 120),
+          });
+          continue;
+        }
         if (!credentials.disable(account.email, error.message, account)) {
           log.info("refresh", "ignored outdated account verification", { account: account.email });
           return null;
