@@ -39,18 +39,22 @@ const get = async (p, ms = 5000) => {
   }
 };
 
-// 1. 代理前置检查
+// 1. 代理前置检查（仅当 .env 配置了 ARENA_AGENT_PROXY 时——直连部署跳过）
 const socksMatch = (dotEnv.ARENA_AGENT_PROXY || "").match(/127\.0\.0\.1:(\d+)/);
-const socksPort = socksMatch ? socksMatch[1] : "10808";
-let proxyIp = "";
-try {
-  proxyIp = execSync(`curl -s --max-time 8 --socks5-hostname 127.0.0.1:${socksPort} https://api.ipify.org`, { timeout: 12_000 }).toString().trim();
-} catch {}
-if (!proxyIp) {
-  console.error(`[arena-bridge] v2rayN proxy not reachable on 127.0.0.1:${socksPort} — start v2rayN first.`);
-  process.exit(1);
+if (socksMatch) {
+  const socksPort = socksMatch[1];
+  let proxyIp = "";
+  try {
+    proxyIp = execSync(`curl -s --max-time 8 --socks5-hostname 127.0.0.1:${socksPort} https://api.ipify.org`, { timeout: 12_000 }).toString().trim();
+  } catch {}
+  if (!proxyIp) {
+    console.error(`[arena-bridge] v2rayN proxy not reachable on 127.0.0.1:${socksPort} — start v2rayN first.`);
+    process.exit(1);
+  }
+  console.log(`[arena-bridge] proxy exit: ${proxyIp}`);
+} else {
+  console.log("[arena-bridge] no ARENA_AGENT_PROXY configured — direct connection mode");
 }
-console.log(`[arena-bridge] proxy exit: ${proxyIp}`);
 
 // 2. 已在运行则退出
 const existing = await get("/health", 3000);
