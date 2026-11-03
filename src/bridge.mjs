@@ -2076,6 +2076,20 @@ export class Bridge {
           }
           if (!browserAlive) await this.browser.close().catch(() => undefined);
           parsed = await runOnce();
+        } else if (/\b401\b|Public Access Token is invalid/i.test(msg) && !delivered) {
+          // A credential refresh re-signs the account cookie; Arena then
+          // REVOKES every public-access-token signed under the old cookie —
+          // including the one embedded in our still-open page's HTML. Landing
+          // and re-reading does NOT fix it: the stale context regenerates the
+          // same revoked token. The only cure is a full browser drop — the
+          // next runOnce re-creates context and page, which signs fresh
+          // tokens. delivered=false guarantees the prompt was never accepted,
+          // so the resend cannot double-post.
+          log.warn("bridge", "converse: append 401 (stale public token after credential refresh); dropping browser and retrying once", {
+            sessionId,
+          });
+          await this.browser.close().catch(() => undefined);
+          parsed = await runOnce();
         } else {
           throw error;
         }
