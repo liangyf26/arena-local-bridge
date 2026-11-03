@@ -854,6 +854,22 @@ export class Bridge {
       })
       .catch(() => ({ found: false, enabled: false }));
     if (!clickedSend.found || !clickedSend.enabled) await editor.press("Enter").catch(() => undefined);
+    // Verify the send actually left: a click on the real button can still be a
+    // silent no-op (React state lag — the composer text was injected via
+    // insertText, not typed), and nothing then ever POSTs. Check from inside
+    // the page that an append request is in flight; if not, press Enter, which
+    // submits through the composer's own key path.
+    const appendedSoon = await page
+      .waitForRequest((request) => sessionUrlMatches(request.url()) && request.url().includes("/in/append"), { timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!appendedSoon) {
+      log.info("bridge", "append not in flight after click; pressing Enter", { sessionId: state.id });
+      await editor.press("Enter").catch(() => undefined);
+      await page
+        .waitForRequest((request) => sessionUrlMatches(request.url()) && request.url().includes("/in/append"), { timeout: 8_000 })
+        .catch(() => null);
+    }
     // Arm the ack window: the page hook stamps completed appends; anything
     // completing AFTER this moment is our ack.
     await page
