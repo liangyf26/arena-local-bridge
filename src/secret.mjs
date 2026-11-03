@@ -149,6 +149,23 @@ export function currentAccount() {
   return domain && !name.includes("\\") ? `${domain}\\${name}` : name;
 }
 
+// icacls account references to TRY, in order. USERDOMAIN is not always a
+// usable icacls reference: on a WORKGROUP machine it can be the literal
+// "WORKGROUP", which icacls cannot resolve (measured on a standalone Windows
+// Server: the whole grant sequence fails with the file's ACL untouched). The
+// computer-name-qualified and bare forms cover that case; on a domain machine
+// the first form keeps working and the others are never reached.
+export function candidateAccounts() {
+  const name = String(process.env.USERNAME || "").trim() || os.userInfo().username;
+  const domain = String(process.env.USERDOMAIN || "").trim();
+  const computer = String(process.env.COMPUTERNAME || "").trim();
+  const out = [];
+  if (domain && !name.includes("\\")) out.push(`${domain}\\${name}`);
+  if (computer) out.push(`${computer}\\${name}`);
+  out.push(name);
+  return [...new Set(out)];
+}
+
 // Owner-only for a file this module has just created, or say that you could
 // not. writeSecretFile is the only caller, and being the only caller is what
 // makes the several icacls calls of icaclsFreshFileCommands safe here: the file
@@ -161,17 +178,21 @@ function protectFreshFile(file) {
     fs.chmodSync(file, 0o600);
     return;
   }
-  const account = currentAccount();
-  try {
-    for (const args of icaclsFreshFileCommands(file, account)) {
-      execFileSync("icacls", args, { windowsHide: true, stdio: "ignore" });
+  const attempts = [];
+  for (const account of candidateAccounts()) {
+    try {
+      for (const args of icaclsFreshFileCommands(file, account)) {
+        execFileSync("icacls", args, { windowsHide: true, stdio: "ignore" });
+      }
+      return; // this reference resolved; the ACL is owner-only
+    } catch (error) {
+      attempts.push(`${account}: ${String(error?.message || error).slice(0, 120)}`);
     }
-  } catch (error) {
-    throw Object.assign(
-      new Error(`could not make ${file} owner-only (${account}): ${String(error?.message || error)}`),
-      { code: "secret_not_restricted" }
-    );
   }
+  throw Object.assign(
+    new Error(`could not make ${file} owner-only (tried: ${attempts.join(" | ")})`),
+    { code: "secret_not_restricted" }
+  );
 }
 
 // Make one file owner-only, or say that you could not.
