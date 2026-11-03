@@ -190,6 +190,47 @@ if (command === "slot") {
   });
 
   const isCode = hasFlag("code");
+  // Identity-leak scan: when a model glitches, it leaks its OWN tool-call /
+  // role boundary tokens into the transcript. Those tokens are per-family and
+  // are a gold-standard identity signal when present (v3 was identified as
+  // MiniMax exactly this way). Scanned live from the session page.
+  let leakScan = null;
+  try {
+    const cfgMod = await import("../src/config.mjs");
+    const dotEnvL = cfgMod.loadDotEnv(path.join(dataDir, ".env"));
+    const cfgL = cfgMod.loadConfig({ ...dotEnvL, ...process.env }, { requireBridgeKey: false });
+    const { CredentialStore } = await import("../src/credentials.mjs");
+    const { ArenaBrowser } = await import("../src/arena-login.mjs");
+    const secretL = (await import("../src/secret.mjs")).requireSecret(dotEnvL);
+    const credsL = new CredentialStore({ filePath: cfgL.credentialsFile, secret: secretL, omniDbPath: cfgL.omniDbPath, omniRoot: cfgL.omniRoot }).load();
+    const browserL = new ArenaBrowser({ omniRoot: cfgL.omniRoot, chromePath: cfgL.chromePath, proxy: cfgL.proxy });
+    const pageL = await browserL.getPage(credsL.primary(), "converse");
+    await pageL.goto(`https://arena.ai/agent/${sessionId}`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => undefined);
+    await pageL.waitForTimeout(7_000);
+    leakScan = await pageL.evaluate(() => {
+      const text = document.body.innerText || "";
+      const patterns = {
+        minimax: /<\]?minimax\[?>?/gi,
+        toolcall_hermes: /<tool_call>/gi,
+        qwen_im: /<\|im_start\|>|<\|im_end\|>/gi,
+        kimi: /<\|?kimi[ _-]?(start|end|token)?\|?>/gi,
+        glm_pipe: /<\|(assistant|tool|user|system)\|>/gi,
+        deepseek: /<\|deepseek[a-z_]*\|>/gi,
+        openai_pipe: /<\|(start|end|assistant|user|python|ipython)\|>/gi,
+        anthropic: /<function_calls>|<invoke|antml:/gi,
+        python_tag: /<\|python_tag\|>/gi,
+      };
+      const out = {};
+      for (const [name, re] of Object.entries(patterns)) {
+        const hits = text.match(re);
+        if (hits) out[name] = { n: hits.length, ex: [...new Set(hits)].slice(0, 2) };
+      }
+      return { leaks: out, transcriptLen: text.length };
+    }).catch((e) => ({ error: String(e).slice(0, 80) }));
+    await browserL.close().catch(() => undefined);
+  } catch (error) {
+    leakScan = { error: String(error).slice(0, 80) };
+  }
   const codeRank = (name) => {
     const m = (baseline.models || []).find((x) => x.name === name);
     return m?.rank ?? null;
@@ -199,7 +240,7 @@ if (command === "slot") {
     .map((m) => `#${m.rank} ${m.name}`);
 
   if (hasFlag("json")) {
-    console.log(JSON.stringify({ ...result, codeRank: result.model ? codeRank(result.model) : null }, null, 2));
+    console.log(JSON.stringify({ ...result, codeRank: result.model ? codeRank(result.model) : null, leakScan }, null, 2));
   } else {
     for (const s of signals) {
       console.error(`# signal ${s.signal}: ${s.votes.length} vote(s)${s.notes?.length ? ` (${s.notes.join("; ")})` : ""}`);
@@ -217,6 +258,23 @@ if (command === "slot") {
       console.log(`verdict  : ${result.status} (${result.agreement.agreeing.join(", ") || "no agreement"} — gate ${result.agreement.required})`);
     } else {
       console.log(`verdict  : ${result.status} — ${result.reason}`);
+    }
+    // Identity-leak scan: a model that glitches leaks its OWN boundary tokens
+    // (v3 was identified as MiniMax exactly this way). When present, this
+    // overrides statistical votes — it is a direct confession.
+    if (leakScan?.error) {
+      console.log(`leak scan: unavailable (${leakScan.error})`);
+    } else if (leakScan) {
+      const names = Object.keys(leakScan.leaks || {});
+      if (names.length) {
+        console.log(`leak scan: ⚑ IDENTITY LEAK — ${names.join(", ")}`);
+        for (const [name, info] of Object.entries(leakScan.leaks)) {
+          console.log(`  ${name}: ${info.n} hit(s), e.g. ${info.ex.join(" ")}`);
+        }
+        console.log(`  (a leaked family token is a direct confession — weight it above the statistical votes)`);
+      } else {
+        console.log(`leak scan: clean (transcript ${leakScan.transcriptLen} chars, no boundary tokens leaked)`);
+      }
     }
     if (isCode) {
       console.log(`\ncode top-10 for reference:`);
