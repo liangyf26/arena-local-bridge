@@ -663,9 +663,21 @@ export class Bridge {
           )
           .catch(() => undefined);
       }
+      // Hydration check: the transcript can render from cached HTML while the
+      // app's JS never boots (observed after a proxy outage — the composer
+      // accepts text, but no React state, so Send is a silent no-op and no
+      // realtime stream ever opens). A dead app must be reloaded even though
+      // the text LOOKS fine.
+      const hydrated = await page
+        .evaluate(() => Boolean(window.__NEXT_DATA__ || document.getElementById("__NEXT_DATA__")))
+        .catch(() => false);
       const t = await page.evaluate(() => document.body.innerText || "").catch(() => "");
-      if (!/taking longer than expected|Reload the page/i.test(t)) break;
-      log.warn("bridge", "Arena SPA fallback page; reloading", { sessionId: state.id, try: i + 1 });
+      if (!/taking longer than expected|Reload the page/i.test(t) && hydrated) break;
+      log.warn("bridge", "Arena page not hydrated (or SPA fallback); reloading", {
+        sessionId: state.id,
+        try: i + 1,
+        hydrated,
+      });
       await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => undefined);
       await page.waitForTimeout(5_000);
     }
