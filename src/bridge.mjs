@@ -749,6 +749,18 @@ export class Bridge {
     try {
       await editor.waitFor({ state: "visible", timeout: this.config.composerWaitMs });
     } catch {
+      // Capture the stuck page before giving up — the "likely causes" below are
+      // guesses, and guessing here has cost full debugging cycles.
+      try {
+        const diag = await page.evaluate(() => ({
+          url: location.href,
+          editors: document.querySelectorAll('[contenteditable="true"]').length,
+          reviewPanel: /was this task successful|此任务成功/i.test(document.body?.innerText || ""),
+          bodyTail: (document.body?.innerText || "").slice(-400),
+        }));
+        log.error("bridge", "composer stuck; page state", diag);
+        await page.screenshot({ path: `/tmp/session-stuck-${state.id.slice(0, 8)}.png` }).catch(() => undefined);
+      } catch {}
       // The composer never became visible. On this UI that means the session is
       // NOT in an interactive state: it is showing the "was this task
       // successful?" review panel, or the run has completed and the composer is
