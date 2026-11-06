@@ -242,6 +242,12 @@ export class ArenaBrowser {
         if (this.proxy) args.push(`--proxy-server=${this.proxy}`);
         const launchOpts = { headless: process.env.ARENA_HEADED !== "1", args };
         if (this.chromePath) launchOpts.executablePath = this.chromePath;
+        log.info("arena-login", "browser launch", {
+          headless: launchOpts.headless,
+          headedEnv: process.env.ARENA_HEADED || "(unset)",
+          chrome: this.chromePath || "(bundled)",
+          proxy: this.proxy || "(direct)",
+        });
         this.browser = await this.pw.chromium.launch(launchOpts);
         return this.browser;
       },
