@@ -27,6 +27,14 @@ async function main() {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const dotEnv = loadDotEnv(path.join(dataDir, ".env"));
   const mergedEnv = { ...dotEnv, ...process.env };
+  // Some flags are read via process.env deep inside modules (arena-login's
+  // ARENA_HEADED), not through config — a scheduled task or service has no
+  // shell to export them, so export the .env values back for those names.
+  for (const name of ["ARENA_HEADED", "ARENA_LOCALE"]) {
+    if (mergedEnv[name] !== undefined && process.env[name] === undefined) {
+      process.env[name] = mergedEnv[name];
+    }
+  }
   let config = loadConfig(mergedEnv);
   log.info("boot", "arena-bridge starting", {
     version: VERSION,
