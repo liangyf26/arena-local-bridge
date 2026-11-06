@@ -225,21 +225,49 @@ async function main() {
     })
     .catch((error) => log.error("boot", "account verification crashed", { error: error.message }));
 
-  // 8. Auto-refresh loop: re-login when the auth cookie approaches expiry
+  // 8. Auto-refresh loop: re-login when the auth cookie approaches expiry.
+  // EVERY account with a stored password is refreshed, not just the primary —
+  // sessions owned by secondary accounts (see credentials.forSession) would
+  // otherwise expire ~1h after their login and every turn on them would be
+  // served as a visitor ("This chat belongs to another account").
   const refreshInterval = Math.max(60_000, config.refreshMarginSec * 1000);
   const refreshTimer = setInterval(async () => {
-    const account = credentials.primary();
-    if (!account) {
+    const anyUsable = credentials.primary();
+    if (!anyUsable) {
       log.error("refresh", "no usable account; attempting to recover", { error: credentials.lastLoginError });
       await ensureUsableAccount().catch(() => undefined);
       return;
     }
-    if (!credentials.needsRefresh(account, config.refreshMarginSec)) return;
-    log.info("refresh", "cookie near expiry; re-logging in", {
-      account: account.email,
-      expiry: credentials.expirySummary(account),
-    });
-    await ensureUsableAccount().catch(() => undefined);
+    for (const account of credentials.list()) {
+      if (!account?.loginSecret || account.disabled) continue;
+      if (!credentials.needsRefresh(account, config.refreshMarginSec)) continue;
+      log.info("refresh", "cookie near expiry; re-logging in", {
+        account: account.email,
+        expiry: credentials.expirySummary(account),
+      });
+      try {
+        const loginSecret = credentials.loginSecretFor(account);
+        const result = await bridge.browser.login(loginSecret.email, loginSecret.password);
+        if (!credentials.replaceCookie(result.email, result.cookieHeader, account)) {
+          log.info("refresh", "ignored outdated account verification", { account: account.email });
+          continue;
+        }
+        bridge.readyAccounts.add(result.email.toLowerCase());
+        log.info("refresh", "account verified and refreshed", { account: result.email });
+      } catch (error) {
+        const msg = String(error?.message || "");
+        if (/ERR_PROXY_CONNECTION_FAILED|proxy|ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_(RESET|TIMED_OUT|REFUSED)|timeout/i.test(msg)) {
+          log.warn("refresh", "verification skipped: network/proxy outage (account NOT disabled)", {
+            account: account.email,
+            error: msg.slice(0, 120),
+          });
+          continue;
+        }
+        credentials.disable(account.email, error.message, account);
+        bridge.readyAccounts.delete(account.email.toLowerCase());
+        log.error("refresh", "account refresh failed; disabled", { account: account.email, error: msg.slice(0, 120) });
+      }
+    }
   }, refreshInterval);
   refreshTimer.unref?.();
 
