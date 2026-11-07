@@ -610,7 +610,7 @@ export class ArenaBrowser {
                       }
                       await writer.write(value).catch(() => {});
                       window.__arenaBridgeOutSeq = (window.__arenaBridgeOutSeq || 0) + 1;
-                      window.__arenaBridgeOutData.push({ id: window.__arenaBridgeOutSeq, conn, text: decoder.decode(value, { stream: true }) });
+                      window.__arenaBridgeOutData.push({ id: window.__arenaBridgeOutSeq, conn, at: Date.now(), text: decoder.decode(value, { stream: true }) });
                       if (window.__arenaBridgeOutData.length > 300) window.__arenaBridgeOutData.splice(0, window.__arenaBridgeOutData.length - 300);
                     }
                   })().catch(() => {});

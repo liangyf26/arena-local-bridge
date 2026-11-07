@@ -151,6 +151,10 @@ export class Bridge {
     // completed turns in passing; failures inside it must never take a turn
     // down (recordTurn swallows its own errors).
     this.telemetry = new TelemetryCapture({ dataDir: config.dataDir, enabled: config.telemetryCapture !== false });
+    // §4.41 — set by the boot layer (index.mjs): best-effort re-login for one
+    // account email. Turns that hit a "Sign in to open this chat" wall use it
+    // to refresh the session owner and retry on the fresh cookie.
+    this.refreshAccount = null;
   }
 
   #mcpInjectedPath() {
@@ -668,8 +672,23 @@ export class Bridge {
       // accepts text, but no React state, so Send is a silent no-op and no
       // realtime stream ever opens). A dead app must be reloaded even though
       // the text LOOKS fine.
+      // §4.39 — __NEXT_DATA__ no longer exists: the agent app runs on the Next.js
+      // App Router, so that check failed on EVERY healthy page and reloaded it
+      // three times per append (log: 48 "not hydrated" warnings / 11 appends).
+      // The churn also reset the /out tap and dragged down the reCAPTCHA v3
+      // score — pages were clicked seconds after a reload triple. The app's own
+      // realtime /out fetch (recorded by the wire hook) is the "JS actually
+      // booted" signal on App Router; give it a bounded grace so a slow boot
+      // isn't reloaded mid-boot.
       const hydrated = await page
-        .evaluate(() => Boolean(window.__NEXT_DATA__ || document.getElementById("__NEXT_DATA__")))
+        .evaluate(async () => {
+          if (window.__NEXT_DATA__ || document.getElementById("__NEXT_DATA__")) return true;
+          for (let i = 0; i < 16; i++) {
+            if (window.__arenaBridgeOutWire && window.__arenaBridgeOutWire.url) return true;
+            await new Promise((r) => setTimeout(r, 500));
+          }
+          return Boolean(window.__arenaBridgeOutWire && window.__arenaBridgeOutWire.url);
+        })
         .catch(() => false);
       const t = await page.evaluate(() => document.body.innerText || "").catch(() => "");
       if (!/taking longer than expected|Reload the page/i.test(t) && hydrated) break;
@@ -751,8 +770,9 @@ export class Bridge {
     } catch {
       // Capture the stuck page before giving up — the "likely causes" below are
       // guesses, and guessing here has cost full debugging cycles.
+      let diag = null;
       try {
-        const diag = await page.evaluate(() => ({
+        diag = await page.evaluate(() => ({
           url: location.href,
           editors: document.querySelectorAll('[contenteditable="true"]').length,
           reviewPanel: /was this task successful|此任务成功/i.test(document.body?.innerText || ""),
@@ -767,6 +787,18 @@ export class Bridge {
       // hidden. Surface a clear, actionable error instead of the raw Playwright
       // timeout (which the HTTP layer would otherwise report as an opaque 502
       // after a long wait — see VERIFICATION-RESULT.md §4.13.4).
+      // §4.41 — a "Sign in to open this chat" wall is the session-owner
+      // account's cookie having expired: retryable after that account
+      // re-logs-in, which converse() triggers via this.refreshAccount.
+      if (/sign in to open this chat/i.test(String(diag?.bodyTail || ""))) {
+        throw Object.assign(
+          new Error(
+            `Arena wants the session owner to sign in again (account cookie expired) for ${state.id}. ` +
+              `The bridge will re-log that account and retry.`
+          ),
+          { status: 503, code: "session_signin_wall" }
+        );
+      }
       throw Object.assign(
         new Error(
           `Arena session is not interactive: the message composer never became visible for ${state.id}. ` +
@@ -861,6 +893,14 @@ export class Bridge {
     // arena's own frontend attach the reCAPTCHA v3 token and POST the message —
     // verified working on the live /agent page. Fall back to Enter only if the
     // button can't be located in this particular UI state.
+    // §4.38 — snapshot the /out tap cursor right before the send. Every chunk
+    // with a larger id is live traffic of THIS turn (history replay stopped
+    // flowing long before this point), which readLatestTurn uses as its turn
+    // window when the model never echoes the end-of-turn marker (§4.36) —
+    // without it such a read spun to its full 600s deadline.
+    state.appendSeq = await page
+      .evaluate(() => window.__arenaBridgeOutSeq || 0)
+      .catch(() => 0);
     // Same reCAPTCHA trap as createAgentSession — see #warmRecaptcha.
     await this.#warmRecaptcha(page);
     const clickedSend = await page
@@ -901,6 +941,34 @@ export class Bridge {
         window.__arenaBridgeAppendAckAt = Date.now();
       })
       .catch(() => undefined);
+    // §4.40 — the /out stream IS the ack: the server only starts the turn
+    // (data-agent-dispatch / start / deltas) after the append was accepted, so
+    // the first tap chunk beyond the pre-send snapshot proves delivery. This is
+    // both faster and more truthful than the alternatives — waitForResponse
+    // surfaced ~155s late on a DELIVERED message, and the app-side stamp never
+    // fires (the app's append fetch isn't page-visible). Only data records
+    // count; heartbeat/comment frames carry no `"records"`.
+    const streamAcked = state.appendSeq
+      ? await page
+          .waitForFunction(
+            (seq) =>
+              (window.__arenaBridgeOutData || []).some(
+                (c) => c.id > seq && c.text && c.text.includes('"records"')
+              ),
+            state.appendSeq,
+            { polling: 250, timeout: 20_000 }
+          )
+          .then(() => true)
+          .catch(() => false)
+      : false;
+    if (streamAcked) {
+      page.off("request", tokenListener);
+      if (observedToken) state.token = observedToken;
+      if (observedOutUrl) state.outUrl = observedOutUrl;
+      if (observedLastEventId && !state.lastEventId) state.lastEventId = observedLastEventId;
+      log.info("bridge", "append delivered (stream ack)", { sessionId: state.id });
+      return;
+    }
     // The append POST itself now rides the page's fetch hook: since the
     // agent-runner form landed, the app's append request may not surface as a
     // Playwright-visible response (the same SW-layer obfuscation as /out), so
@@ -937,9 +1005,25 @@ export class Bridge {
       return;
     }
     if (!response) {
-      // Neither path saw an ack. Diagnostic: was the message actually sent?
-      // Did the wire see the /out reconnect? (append-timeout turned out to
-      // outlive a DELIVERED message.)
+      // §4.38 — neither ack path fired within the budget, but the append POST
+      // itself WAS seen leaving the page (appendedSoon). Historically the
+      // message is delivered in exactly this state (§4.1) — the ack surface is
+      // just invisible. Proceeding to the read costs nothing: it waits for the
+      // reply on its own deadline and the caller retries on a genuinely empty
+      // result. Throwing here instead turned a delivered message into a 504
+      // and re-queued the same turn behind a full composerWaitMs stall.
+      if (appendedSoon) {
+        page.off("request", tokenListener);
+        if (observedToken) state.token = observedToken;
+        if (observedOutUrl) state.outUrl = observedOutUrl;
+        if (observedLastEventId && !state.lastEventId) state.lastEventId = observedLastEventId;
+        log.warn("bridge", "append ack unconfirmed; request left the page — proceeding to read", {
+          sessionId: state.id,
+        });
+        return;
+      }
+      // Neither path saw an ack and no append request ever left. Diagnostic:
+      // was the message actually sent? Did the wire see the /out reconnect?
       const state2 = await page
         .evaluate(() => ({
           bodyTail: (document.body.innerText || "").slice(-600),
@@ -1115,7 +1199,7 @@ export class Bridge {
     }
     try {
       return await page.evaluate(
-      async ({ id, token, outUrl, lastEventId, readBudgetMs, readAbortMs, marker }) => {
+      async ({ id, token, outUrl, lastEventId, readBudgetMs, readAbortMs, marker, appendSeq }) => {
         // ── TAP MODE ────────────────────────────────────────────────────────
         // The 2026-10-31 deployments put /out behind a service-worker-injected
         // bearer + cursor and stopped serving the stream to page-level parallel
@@ -1131,7 +1215,18 @@ export class Bridge {
               : readBudgetMs && Number(readBudgetMs) > 0
                 ? t0 + Number(readBudgetMs) + 30_000
                 : t0 + 600_000;
+          // §4.38 — start at the pre-send snapshot when available: everything
+          // after it is THIS turn's live traffic, so the read no longer depends
+          // on the marker to tell our turn from the replayed history. Guard
+          // against a page reload between snapshot and read (the tap buffer and
+          // its counter would have restarted from 1 — a maxId below appendSeq).
           let lastSeq = 0; // consume the tap from its start; marker windows pick our turn
+          {
+            const arr0 = window.__arenaBridgeOutData;
+            const maxId = arr0 && arr0.length ? arr0[arr0.length - 1].id : 0;
+            if (appendSeq > 0 && maxId >= appendSeq) lastSeq = appendSeq;
+          }
+          const liveMode = lastSeq > 0;
           let carry = "";
           const turns = new Map();
           // The reply is the TEXT stream only. Reasoning deltas are kept in
@@ -1152,9 +1247,17 @@ export class Bridge {
           let msToFinish = 0;
           let toolAfterReplay = false;
           let finishCount = 0;
+          // §4.38 — live-window settling: when the marker is never echoed, the
+          // read may still break early once our turn has finished and the stream
+          // went quiet, instead of spinning to the 600s deadline (which is what
+          // made every non-marker turn cost ten minutes).
+          let lastMeaningfulAt = t0; // last parsed record that carried a data.type
+          let finishAfterLastTool = true; // §4.34: a finish has followed the last tool event
+          let breakReason = "";
           const dbg = [];
 
           const handleEvent = (data) => {
+            lastMeaningfulAt = Date.now();
             const node = data.messageMetadata?.nodeId || data.nodeId || curNode;
             const key = String(node);
             if (dbg.length < 80 && data.type) {
@@ -1179,17 +1282,20 @@ export class Bridge {
             }
             if (data.type === "tool-input-start" && data.toolCallId) {
               toolAfterReplay = true;
+              finishAfterLastTool = false;
               nativeById.set(String(data.toolCallId), { id: String(data.toolCallId), name: String(data.toolName || ""), rawInput: "" });
               events.push({ type: data.type, key, pos: events.length });
             }
             if (data.type === "tool-input-delta" && data.toolCallId) {
               toolAfterReplay = true;
+              finishAfterLastTool = false;
               const cur = nativeById.get(String(data.toolCallId)) || { id: String(data.toolCallId), name: "", rawInput: "" };
               cur.rawInput += String(data.inputTextDelta || "");
               nativeById.set(String(data.toolCallId), cur);
             }
             if ((data.type === "tool-input-available" || data.type === "tool-input-error") && data.toolCallId) {
               toolAfterReplay = true;
+              finishAfterLastTool = false;
               const cur = nativeById.get(String(data.toolCallId)) || { id: String(data.toolCallId), name: "", rawInput: "" };
               cur.name = String(data.toolName || cur.name || "");
               cur.input = data.input;
@@ -1201,6 +1307,7 @@ export class Bridge {
               curNode = data.messageMetadata?.nodeId || curNode;
               hasFinish = true;
               finishCount += 1;
+              finishAfterLastTool = true;
               if (!msToFinish) msToFinish = Date.now() - t0;
               events.push({ type: "finish", key, pos: events.length });
             }
@@ -1254,8 +1361,33 @@ export class Bridge {
               }
             }
             lastSeq = newest;
-            if (hasFinish && sawMarker && turnCompleteSeen) break;
-            if (hasFinish && sawMarker && Date.now() - t0 > 8_000) break;
+            if (hasFinish && sawMarker && turnCompleteSeen) { breakReason = "tap:marker"; break; }
+            if (hasFinish && sawMarker && Date.now() - t0 > 8_000) { breakReason = "tap:marker"; break; }
+            // §4.38 — live-window settle (only when consuming from the pre-send
+            // snapshot, so every parsed event is THIS turn's): text streamed, a
+            // finish came, and the stream has gone quiet for 8s. When the last
+            // event was a tool step, report tool-pending so the `allow` policy
+            // keeps following the turn instead of returning a half answer.
+            const liveText = textTurns.size > 0;
+            if (liveMode && hasFinish && liveText && Date.now() - lastMeaningfulAt > 8_000) {
+              breakReason = finishAfterLastTool ? "tap:live-settled" : "tap:live-tool-pending";
+              break;
+            }
+            // §4.38 — fail fast on a rejected turn: Arena emits an error event
+            // (e.g. "recaptcha validation failed") and NO reply ever comes —
+            // no finish, no marker. Waiting for either burned the full 600s
+            // budget on turns that had failed in their first seconds.
+            if (liveMode && errText && !liveText && Date.now() - lastMeaningfulAt > 8_000) {
+              breakReason = "tap:error-early";
+              break;
+            }
+            // §4.38 — nothing at all for two minutes: the send silently failed
+            // (no dispatch, no start, no error). Give the re-read/retry layers a
+            // chance instead of sitting out the whole deadline.
+            if (liveMode && events.length === 0 && Date.now() - t0 > 120_000) {
+              breakReason = "tap:silent";
+              break;
+            }
             await new Promise((r) => setTimeout(r, 400));
           }
 
@@ -1310,7 +1442,7 @@ export class Bridge {
               toolAfterReplay,
               ourTurnFinishes,
               ourSteps: ourTurnFinishes,
-              breakReason: "tap-drained",
+              breakReason: breakReason || "tap-drained",
             },
             debug: {
               lastNode: String(lastNode),
@@ -1606,7 +1738,7 @@ export class Bridge {
           await reader?.cancel().catch(() => undefined);
         }
       },
-      { id: state.id, token: state.token, outUrl: state.outUrl || "", lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "" }
+      { id: state.id, token: state.token, outUrl: state.outUrl || "", lastEventId: state.lastEventId || "", readBudgetMs: state.readBudgetMs || 0, readAbortMs: state.readBudgetMs && state.readBudgetMs > 0 ? state.readBudgetMs + 30_000 : 0, marker: state.marker || "", appendSeq: state.appendSeq || 0 }
       );
     } finally {
       if (sinkActive) this._deltaSink = null;
@@ -2100,6 +2232,16 @@ export class Bridge {
           }
           if (!browserAlive) await this.browser.close().catch(() => undefined);
           parsed = await runOnce();
+        } else if (error?.code === "session_signin_wall") {
+          // §4.41 — the session-owner account's cookie expired mid-pool. Re-log
+          // that account (best-effort, wired by the boot layer) and retry the
+          // turn once: delivered is still false, so the resend cannot double-post.
+          log.warn("bridge", "converse: sign-in wall on session owner; re-logging account and retrying once", {
+            sessionId,
+            account,
+          });
+          await this.refreshAccount?.(account).catch(() => undefined);
+          parsed = await runOnce();
         } else if (/\b401\b|Public Access Token is invalid/i.test(msg) && !delivered) {
           // A credential refresh re-signs the account cookie; Arena then
           // REVOKES every public-access-token signed under the old cookie —
@@ -2180,7 +2322,10 @@ export class Bridge {
           // read would just cost another minute for nothing.
           const unsettled =
             parsed.timing?.breakReason !== "turn+marker" &&
-            (!(parsed.text || "").trim() || parsed.timing?.breakReason === "budget");
+            parsed.timing?.breakReason !== "tap:marker" &&
+            (!(parsed.text || "").trim() ||
+              parsed.timing?.breakReason === "budget" ||
+              parsed.timing?.breakReason === "tap:live-tool-pending");
           for (
             let i = 0;
             i < this.config.toolAllowMaxReads && (!hasToolDeadline || Date.now() < deadline) && parsed.toolAfterReplay && unsettled;
@@ -2189,7 +2334,14 @@ export class Bridge {
             await new Promise((r) => setTimeout(r, 1_500));
             if (!sessionState) break;
             if (parsed.lastEventId) sessionState.lastEventId = parsed.lastEventId;
-            const next = await this.readLatestTurn(await this.#page(account, purpose), sessionState);
+            const followPage = await this.#page(account, purpose);
+            // §4.38 — follow-up reads only want events after everything seen so
+            // far: re-snapshot the tap cursor, or the read would re-consume this
+            // turn's already-captured text and the loop would append it twice.
+            sessionState.appendSeq = await followPage
+              .evaluate(() => window.__arenaBridgeOutSeq || 0)
+              .catch(() => 0);
+            const next = await this.readLatestTurn(followPage, sessionState);
             if (next.token) sessionState.token = next.token;
             if (next.lastEventId) parsed.lastEventId = next.lastEventId;
             for (const call of next.nativeCalls || []) {
@@ -2271,6 +2423,29 @@ export class Bridge {
           });
           break;
         }
+      }
+
+      // §4.38b — Arena can reject a send at dispatch time with a stream error
+      // ("recaptcha validation failed"): the POST was accepted, but the agent
+      // never runs and no reply ever comes — the turn is dead. The only cure is
+      // resending on a fresh state (fresh page state, fresh token mint at the
+      // next click). The prompt was never answered, so one resend cannot double-
+      // reply; worst case the session shows the prompt twice. Retry once.
+      if (!String(parsed.text || "").trim() && /recaptcha|captcha|validation failed/i.test(parsed.errorText || "")) {
+        log.warn("bridge", "converse: arena rejected the turn (recaptcha-class error); resending once", {
+          sessionId,
+          errorText: (parsed.errorText || "").slice(0, 120),
+        });
+        await new Promise((r) => setTimeout(r, 2_000));
+        delivered = false;
+        // The errored turn can leave the SPA in a state where the composer
+        // accepts text but Send is a no-op (observed: click + Enter both dead).
+        // A fresh load clears it before the resend.
+        try {
+          const retryPage = await this.#page(account, purpose);
+          await retryPage.reload({ waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => undefined);
+        } catch {}
+        parsed = await runOnce();
       }
 
       // §4.36 — release the held-back tail (marker already stripped inside) and

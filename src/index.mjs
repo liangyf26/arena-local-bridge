@@ -218,10 +218,62 @@ async function main() {
 
   // 7. Verify after HTTP is available. The launcher can open the first-run GUI
   // from /health while a slow account login keeps /ready unavailable.
+  // §4.41 — single-account re-login used by turns that hit a "Sign in to open
+  // this chat" wall (session owner's cookie expired). Best-effort: failures
+  // surface in the turn's retry, not here.
+  bridge.refreshAccount = async (email) => {
+    const account = credentials.accountSnapshot(email);
+    if (!account || account.disabled || !account.loginSecret) return;
+    const loginSecret = credentials.loginSecretFor(account);
+    const result = await bridge.browser.login(loginSecret.email, loginSecret.password);
+    if (credentials.replaceCookie(result.email, result.cookieHeader, account)) {
+      bridge.readyAccounts.add(result.email.toLowerCase());
+      log.info("refresh", "account re-logged (turn-time)", { account: result.email });
+    }
+  };
+  // §4.41 — secondary accounts must not sit expired until the refresh tick
+  // (tick interval == the margin, up to 20 minutes): every session owned by an
+  // expired account fails with "Sign in to open this chat" until then.
+  // MUST go through accountsNeedingRefresh(): list() projections hide
+  // loginSecret/cookieHeader, which is why the old timer never refreshed
+  // anyone (every `!account.loginSecret` was true, needsRefresh saw nothing).
+  const refreshNearExpiryAccounts = async () => {
+    for (const { account, email, secondsToExpiry: secs } of credentials.accountsNeedingRefresh(config.refreshMarginSec)) {
+      log.info("refresh", "cookie near expiry; re-logging in", {
+        account: email,
+        expiry: `${Math.max(0, secs)}s`,
+      });
+      try {
+        const loginSecret = credentials.loginSecretFor(account);
+        const result = await bridge.browser.login(loginSecret.email, loginSecret.password);
+        if (!credentials.replaceCookie(result.email, result.cookieHeader, account)) {
+          log.info("refresh", "ignored outdated account verification", { account: email });
+          continue;
+        }
+        bridge.readyAccounts.add(result.email.toLowerCase());
+        log.info("refresh", "account verified and refreshed", { account: result.email });
+      } catch (error) {
+        const msg = String(error?.message || "");
+        if (/ERR_PROXY_CONNECTION_FAILED|proxy|ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_(RESET|TIMED_OUT|REFUSED)|timeout/i.test(msg)) {
+          log.warn("refresh", "verification skipped: network/proxy outage (account NOT disabled)", {
+            account: email,
+            error: msg.slice(0, 120),
+          });
+          continue;
+        }
+        // Background best-effort only: never auto-disable outside the tick.
+        log.warn("refresh", "background account refresh failed (account NOT disabled)", {
+          account: email,
+          error: msg.slice(0, 120),
+        });
+      }
+    }
+  };
   ensureUsableAccount()
-    .then((email) => {
+    .then(async (email) => {
       if (email) log.info("boot", "usable account confirmed", { account: email });
       else if (!bridge.healthPayload().ready) log.error("boot", "no usable Arena account", { error: credentials.lastLoginError });
+      await refreshNearExpiryAccounts().catch(() => undefined);
     })
     .catch((error) => log.error("boot", "account verification crashed", { error: error.message }));
 
@@ -238,36 +290,11 @@ async function main() {
       await ensureUsableAccount().catch(() => undefined);
       return;
     }
-    for (const account of credentials.list()) {
-      if (!account?.loginSecret || account.disabled) continue;
-      if (!credentials.needsRefresh(account, config.refreshMarginSec)) continue;
-      log.info("refresh", "cookie near expiry; re-logging in", {
-        account: account.email,
-        expiry: credentials.expirySummary(account),
-      });
-      try {
-        const loginSecret = credentials.loginSecretFor(account);
-        const result = await bridge.browser.login(loginSecret.email, loginSecret.password);
-        if (!credentials.replaceCookie(result.email, result.cookieHeader, account)) {
-          log.info("refresh", "ignored outdated account verification", { account: account.email });
-          continue;
-        }
-        bridge.readyAccounts.add(result.email.toLowerCase());
-        log.info("refresh", "account verified and refreshed", { account: result.email });
-      } catch (error) {
-        const msg = String(error?.message || "");
-        if (/ERR_PROXY_CONNECTION_FAILED|proxy|ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_(RESET|TIMED_OUT|REFUSED)|timeout/i.test(msg)) {
-          log.warn("refresh", "verification skipped: network/proxy outage (account NOT disabled)", {
-            account: account.email,
-            error: msg.slice(0, 120),
-          });
-          continue;
-        }
-        credentials.disable(account.email, error.message, account);
-        bridge.readyAccounts.delete(account.email.toLowerCase());
-        log.error("refresh", "account refresh failed; disabled", { account: account.email, error: msg.slice(0, 120) });
-      }
-    }
+    // §4.41 — the old inline loop silently skipped every account: list()
+    // projections carry no loginSecret/cookieHeader, so the guard and
+    // needsRefresh were both dead. One shared path now (see
+    // refreshNearExpiryAccounts) — background failures do NOT auto-disable.
+    await refreshNearExpiryAccounts().catch(() => undefined);
   }, refreshInterval);
   refreshTimer.unref?.();
 

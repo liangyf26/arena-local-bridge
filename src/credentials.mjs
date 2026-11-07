@@ -270,10 +270,62 @@ export class CredentialStore {
     return secs === null ? "unknown" : `${Math.max(0, secs)}s`;
   }
 
+  /**
+   * Snapshot of one account by email — the shape loginSecretFor() and
+   * replaceCookie() expect (everything internal plus the DECRYPTED
+   * cookieHeader, like selectNext()/forSession() return). list() projections
+   * deliberately hide secrets and must not be fed into those (they fail
+   * quietly); null when the email is unknown.
+   */
+  accountSnapshot(email) {
+    const account = this.#find(email);
+    if (!account) return null;
+    let cookie = "";
+    try {
+      cookie = decrypt(account.cookieHeader, this.key);
+    } catch {
+      cookie = "";
+    }
+    return { ...account, cookieHeader: cookie };
+  }
+
   needsRefresh(account, marginSec = 1200) {
     const secs = secondsToExpiry(account?.cookieHeader);
     if (secs === null) return false; // unknown expiry -> assume fresh
     return secs < marginSec;
+  }
+
+  /**
+   * Accounts that hold a stored password and whose DECRYPTED auth cookie is
+   * at/near expiry — the real input of every refresh loop.
+   *
+   * Why this exists: list() projections deliberately hide loginSecret and the
+   * (encrypted) cookieHeader, so a loop built on them silently skipped every
+   * account (`!account.loginSecret` was always true) and needsRefresh saw no
+   * cookie at all. The auto-refresh timer shipped that way and never refreshed
+   * anyone.
+   *
+   * The returned `account` is a SNAPSHOT (same shape as selectNext/forSession:
+   * everything internal plus the DECRYPTED cookieHeader) — exactly what
+   * loginSecretFor() and replaceCookie() expect.
+   */
+  accountsNeedingRefresh(marginSec = 1200) {
+    const out = [];
+    for (const account of this.#ordered()) {
+      if (account.disabled || !account.loginSecret) continue;
+      let cookie = "";
+      let secs = null;
+      try {
+        cookie = decrypt(account.cookieHeader, this.key);
+        secs = secondsToExpiry(cookie);
+      } catch {
+        cookie = "";
+        secs = null;
+      }
+      if (secs === null || secs >= marginSec) continue;
+      out.push({ account: { ...account, cookieHeader: cookie }, email: account.email, secondsToExpiry: secs });
+    }
+    return out;
   }
 
   #migrateFromOmni() {
